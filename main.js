@@ -116,14 +116,22 @@ async function main() {
         // 周日刷新token
         if (isBeijingSunday(now)) {
           const refreshToken = await send(`/login/token?timestrap=${Date.now()}`, "POST", headers)
-          if (refreshToken?.status == 1) {
-            if (refreshToken?.data?.token !== user.token) {
-              needRefresh = true
-              printYellow(`${tag} 账号 ${safeNickname} 需要刷新token`)
-              user.token = refreshToken.data.token
-              // 用新 token 重建本次请求的 headers，使后续听歌/VIP 领取使用刷新后的凭证
-              headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
-            }
+          // 必须校验新 token 确实是非空字符串：上游偶发返回 status=1 却不带 data.token，
+          // 旧写法 `data.token !== user.token` 在此时成立（undefined !== 旧值），会把
+          // user.token 赋成 undefined；随后整份凭据数组被 JSON.stringify 写回（undefined
+          // 字段直接消失），该账号永久失效、只能手工重新登录。
+          // 结论：宁可这次不刷新，也绝不能把空值写进凭据。
+          const rawNewToken = refreshToken?.status == 1 ? refreshToken?.data?.token : null
+          const newToken = typeof rawNewToken === 'string' ? rawNewToken.trim() : ''
+          if (newToken && newToken !== String(user.token || '').trim()) {
+            needRefresh = true
+            printYellow(`${tag} 账号 ${safeNickname} 需要刷新token`)
+            user.token = newToken
+            // 用新 token 重建本次请求的 headers，使后续听歌/VIP 领取使用刷新后的凭证
+            headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
+          } else if (refreshToken?.status == 1 && !newToken) {
+            // 刷新接口返回成功但没给有效 token：保持原 token 继续本次签到
+            printYellow(`${tag} 账号 ${safeNickname} token 刷新响应缺少有效 token，已保留原 token`)
           }
         }
 
@@ -303,7 +311,16 @@ async function main() {
   // 刷新后的凭据持久化：Docker 部署写入 USERINFO_FILE 文件（挂载卷），
   // Actions 部署写入 GitHub Secret <USERINFO>（使用完整 userinfo 数组，保留所有用户包括过期账号）
   let secretError = null
-  if (needRefresh) {
+  // 兜底校验：写回前确认每个账号的 token 都是非空字符串。
+  // 凭据文件/Secret 是整份覆盖写的，写进一次 undefined（JSON 序列化会直接丢掉该字段）
+  // 就意味着该账号永久失效，所以宁可本次不写回也不要把残缺数组落盘。
+  const invalidUsers = needRefresh
+    ? userinfo.filter(u => !u || typeof u.token !== 'string' || !u.token.trim())
+    : []
+  if (invalidUsers.length > 0) {
+    printRed(`凭据校验失败：${invalidUsers.length} 个账号的 token 无效，已跳过本次凭据写回（原凭据保持不变）`)
+  }
+  if (needRefresh && invalidUsers.length === 0) {
     const userinfoJSON = JSON.stringify(userinfo)
     // 优先写本地凭据文件（Docker 模式），写失败时降级走 PAT
     let savedToFile = false
