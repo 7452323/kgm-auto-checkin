@@ -581,6 +581,19 @@ const ANSI_CLASS = {
   90: 'c-dim', 91: 'c-red', 92: 'c-green', 93: 'c-yellow', 94: 'c-blue', 95: 'c-magenta',
 }
 
+const ANSI_STRIP_RE = /\x1B\[[0-9;]*m/g
+
+/**
+ * 去掉 ANSI 颜色转义，得到用于分类/匹配的纯文本。
+ *
+ * 日志 text 含原始转义码（colorOut 输出形如 \x1B[33m…\x1B[0m），行尾必然有复位码。
+ * 若直接用原文判定，「开始领取VIP...$」这类以行尾结尾的正则永远匹配不上，
+ * 导致简化模式失效（过程噪音行全部显示出来）。
+ */
+function plainOf(text) {
+  return String(text || '').replace(ANSI_STRIP_RE, '')
+}
+
 function escapeHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
@@ -622,7 +635,7 @@ function ansiToHtml(raw) {
  * @returns {boolean}
  */
 function isSkipLine(text) {
-  return /账号\s*\S+\s*今日已签到，跳过/.test(String(text || ''))
+  return /账号\s*\S+\s*今日已签到，跳过/.test(plainOf(text))
 }
 
 /**
@@ -641,11 +654,12 @@ function isSkipLine(text) {
  * @returns {boolean} true = 详细日志（简化模式下隐藏）
  */
 function isVerboseLine(text) {
-  const t = String(text || '').trim()
+  const t = plainOf(text).trim()
   if (!t) return false
   // 阶段开始提示：每个账号这两行必然出现，属过程噪音，结果行才是有效信息
   if (/开始领取VIP\.{0,3}$/.test(t)) return true
   if (/开始听歌领取VIP\.{0,3}$/.test(t)) return true
+  if (/开始签到$/.test(t)) return true
   // 逐次领取成功：「第3次领取成功」——保留最终统计即可，中间过程不显示
   if (/第\s*\d+\s*次领取成功/.test(t)) return true
   // 等待提示（8 次领取之间各等 30 秒）
@@ -666,7 +680,7 @@ function isVerboseLine(text) {
  * @returns {string|null} 如 "4"，无序号时返回 null
  */
 function accountKeyOf(text) {
-  const m = String(text || '').match(/\[#(\d+)\/\d+\]/)
+  const m = plainOf(text).match(/\[#(\d+)\/\d+\]/)
   return m ? m[1] : null
 }
 

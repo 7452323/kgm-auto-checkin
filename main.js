@@ -80,7 +80,7 @@ async function main() {
 
   // 单账号完整签到流程：并行时各账号独立执行，账号内部保持原有请求节奏（VIP 领取间隔 30s）
   async function processAccount(user, index) {
-    const tag = `[#${index + 1}/${userinfo.length}]`
+    const tag = `[#${String(index + 1).padStart(String(userinfo.length).length, '0')}/${userinfo.length}]`
     const accountErrors = {} // 该账号的错误集（键名含账号标识，账号之间互不冲突，可安全并行写入）
     try {
       // 手动触发：当日已完成签到（无任何错误）的账号直接跳过，不再请求酷狗 API
@@ -111,7 +111,7 @@ async function main() {
           }
         }
         const safeNickname = maskDisplayName(userDetail.data.nickname)
-        printMagenta(`${tag} 账号 ${safeNickname} 开始领取VIP...`)
+        printMagenta(`${tag} 账号 ${safeNickname} 开始签到`)
 
         // 周日刷新token
         if (isBeijingSunday(now)) {
@@ -128,7 +128,7 @@ async function main() {
         }
 
         // 开始听歌
-        printYellow(`${tag} 开始听歌领取VIP...`)
+        printYellow(`${tag} 账号 ${safeNickname} 开始听歌领取VIP...`)
         // 听歌获取vip
         const listen = await send(`/youth/listen/song?timestrap=${Date.now()}`, "GET", headers)
 
@@ -136,20 +136,19 @@ async function main() {
         // 听歌是否成功（含"今日已领取"）：决定该账号当日是否已被标记为完成
         let listenOk = false
         if (listen.status === 1) {
-          printGreen(`${tag} 听歌领取成功`)
+          printGreen(`${tag} 账号 ${safeNickname} 听歌领取成功`)
           listenStatus = '成功'
           listenOk = true
         } else if (listen.error_code === 130012) {
-          printGreen(`${tag} 今日已领取`)
+          printGreen(`${tag} 账号 ${safeNickname} 今日已领取`)
           listenStatus = '今日已领取'
           listenOk = true
         } else {
           accountErrors[`${safeNickname} listen`] = summarizeResponse(listen)
-          printRed(`${tag} 听歌领取失败`)
+          printRed(`${tag} 账号 ${safeNickname} 听歌领取失败`)
           listenStatus = '失败'
         }
 
-        printYellow(`${tag} 开始领取VIP...`)
         let claimCount = 0
         let claimTotal = 0
         // 领取阶段是否出现"非预期"失败：仅此类失败阻止当天标记完成。
@@ -159,18 +158,18 @@ async function main() {
           const ad = await send(`/youth/vip?timestrap=${Date.now()}`, "GET", headers)
           claimTotal = i
           if (ad.status === 1) {
-            printGreen(`${tag} 第${i}次领取成功`)
+            printGreen(`${tag} 账号 ${safeNickname} 第${i}次领取成功`)
             claimCount++
             if (i != 8) {
               await delay(30 * 1000)
             }
           } else if (ad.error_code === 30002) {
-            printGreen(`${tag} 今天次数已用光`)
+            printGreen(`${tag} 账号 ${safeNickname} 今天次数已用光`)
             // 次数用光：把总次数记为已尝试次数，避免通知里出现 3/7 这类含混计数
             claimTotal = claimCount
             break
           } else {
-            printRed(`${tag} 第${i}次领取失败`)
+            printRed(`${tag} 账号 ${safeNickname} 第${i}次领取失败`)
             accountErrors[`${safeNickname} ad`] = summarizeResponse(ad)
             claimFailed = true
             claimTotal = claimCount
@@ -185,10 +184,10 @@ async function main() {
           // 到期时间不再刷进实时日志（改在 WebUI「账号管理」查看，避免每账号 2 行刷屏），
           // 但仍会写入通知内容与账号状态文件；WebUI 模式下通过 CHECKIN_STATUS_FILE 上报。
           if (!process.env.CHECKIN_STATUS_FILE) {
-            printBlue(`${tag} VIP到期时间：${vipExpiry}\n`)
+            printBlue(`${tag} 账号 ${safeNickname} VIP到期时间：${vipExpiry}\n`)
           }
         } else {
-          printRed(`${tag} 获取失败\n`)
+          printRed(`${tag} 账号 ${safeNickname} VIP 详情获取失败\n`)
           accountErrors[`${safeNickname} vip_details`] = summarizeResponse(vip_details)
         }
 
@@ -201,7 +200,7 @@ async function main() {
         if (listenOk && !vipDetailFailed && stateEnabled) {
           doneSet.add(String(user.userid))
           if (claimFailed) {
-            printYellow(`${tag} 今日听歌已完成，领取失败不影响标记（手动触发将跳过该账号）`)
+            printYellow(`${tag} 账号 ${safeNickname} 今日听歌已完成，领取失败不影响标记`)
           }
         }
 
