@@ -11,29 +11,60 @@ let AUTH = sessionStorage.getItem('kc_auth') || ''
 if (AUTH) $('#auth-state').textContent = '已解锁'
 
 let authResolvers = []
+// 弹窗已打开时复用的 Promise：否则 5 秒一次的 refreshStatus 会在每次 401 时
+// 重新压入 resolver 并重置输入框，把用户正在输入的内容清掉。
+let authPromise = null
 
 function askAuth() {
-  return new Promise(resolve => {
+  if (authPromise) return authPromise
+  $('#auth-err').textContent = ''
+  $('#auth-input').value = AUTH
+  authPromise = new Promise(resolve => {
     authResolvers.push(resolve)
-    $('#auth-err').textContent = ''
-    $('#auth-input').value = AUTH
-    if (!$('#auth-dialog').open) $('#auth-dialog').showModal()
+    $('#auth-dialog').showModal()
   })
+  return authPromise
 }
 
 function resolveAuth(ok) {
-  $('#auth-dialog').close()
+  if ($('#auth-dialog').open) $('#auth-dialog').close()
   authResolvers.forEach(r => r(ok))
   authResolvers = []
+  authPromise = null
 }
 
 $('#btn-auth-ok').addEventListener('click', submitAuth)
 $('#auth-input').addEventListener('keydown', e => { if (e.key === 'Enter') submitAuth() })
+$('#btn-auth-cancel').addEventListener('click', () => resolveAuth(false))
+// Esc：拦截默认关闭行为，改为让等待中的请求以「取消」结束，避免 Promise 永久悬挂
+$('#auth-dialog').addEventListener('cancel', e => { e.preventDefault(); resolveAuth(false) })
+
+/**
+ * 用给定密码探测 /api/status，只关心「通不通过」。
+ * 不能走 api()：api() 遇 401 会 await askAuth()，而此刻正是弹窗在等待本次结果，
+ * 两边互等即死锁（密码错误时界面无反应）。
+ *
+ * @param {string} key 待验证的访问密码
+ * @returns {Promise<object>} 通过时返回响应体
+ */
+async function probeAuth(key) {
+  const headers = { 'Content-Type': 'application/json' }
+  if (key) headers['X-WebUI-Key'] = key
+  const res = await fetch('/api/status', { headers })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    const err = new Error(data.error || `HTTP ${res.status}`)
+    err.status = res.status
+    err.data = data
+    throw err
+  }
+  return data
+}
 
 async function submitAuth() {
   AUTH = $('#auth-input').value.trim()
   try {
-    await api('/api/status')
+    await probeAuth(AUTH)
     sessionStorage.setItem('kc_auth', AUTH)
     $('#auth-state').textContent = '已解锁'
     $('#auth-err').textContent = ''
@@ -557,18 +588,28 @@ function escapeHtml(s) {
 /** 把含 ANSI 转义的日志行转换为带颜色的 HTML（colorOut 输出形如 \x1B[31m…\x1B[0m） */
 function ansiToHtml(raw) {
   let html = ''
-  let classes = []
+  let open = false
   let last = 0
   ANSI_RE.lastIndex = 0
   let m
+  // 必须按 SGR 出现的顺序「开/关」span，不能只取最后一段颜色：
+  // colorOut 每行都是 `${color}%s\x1B[0m`，行尾的复位码会把整行颜色清掉。
+  const closeSpan = () => { if (open) { html += '</span>'; open = false } }
   while ((m = ANSI_RE.exec(raw)) !== null) {
     html += escapeHtml(raw.slice(last, m.index))
     last = ANSI_RE.lastIndex
     const codes = (m[1] || '0').split(';').map(c => parseInt(c, 10) || 0)
-    classes = codes.includes(0) ? [] : codes.map(c => ANSI_CLASS[c]).filter(Boolean)
+    closeSpan()
+    if (codes.includes(0)) continue // \x1B[0m 复位：只关闭当前 span
+    const cls = codes.map(c => ANSI_CLASS[c]).filter(Boolean)
+    if (cls.length) {
+      html += `<span class="${cls.join(' ')}">`
+      open = true
+    }
   }
   html += escapeHtml(raw.slice(last))
-  return classes.length ? `<span class="${classes.join(' ')}">${html}</span>` : html
+  closeSpan()
+  return html
 }
 
 /**
@@ -630,18 +671,22 @@ function accountKeyOf(text) {
 }
 
 /**
- * 把行首的「[#N/M]」包装为定宽元素，使后续文字从同一列开始。
- * 必须在 ansiToHtml 之后调用，且只处理「行首、未被 span 包裹」的情形，
- * 否则可能把已带颜色的片段拆坏。
+ * 把「[#N/M]」包装为定宽元素，使后续文字从同一列开始。
+ * 必须在 ansiToHtml 之后调用。着色后标签会落在颜色 span 内部，
+ * 因此不能用「行首未被 span 包裹」的正则，改为就地插入（合法嵌套，不破坏外层颜色）。
  *
  * @param {string} html ansiToHtml 的输出
+ * @param {string} rawText 原始日志文本（用于定位标签）
  * @returns {string}
  */
-function wrapAccountTag(html) {
-  // 仅匹配行首（可能前面有 <span class="ts">…</span> 之类），且标签内不含其他标签
-  return String(html).replace(/^((?:<span[^>]*>[\s\S]*?<\/span>\s*)*)(\[#(\d+)\/\d+\])/, (m, prefix, tag, num) => {
-    return `${prefix}<span class="acct-tag" data-acct="${num}">${tag}</span>`
-  })
+function wrapAccountTag(html, rawText) {
+  const m = String(rawText || '').match(/\[#(\d+)\/\d+\]/)
+  if (!m) return html
+  const tag = m[0]
+  const at = html.indexOf(tag)
+  if (at === -1) return html
+  const span = `<span class="acct-tag" data-acct="${m[1]}">${tag}</span>`
+  return html.slice(0, at) + span + html.slice(at + tag.length)
 }
 
 /** 当前是否显示详细日志（默认简化） */
@@ -748,7 +793,7 @@ function appendLog(entry) {
   // 同一账号的日志标同一序号，供 CSS 做对齐分组
   const acct = accountKeyOf(entry.text)
   if (acct) line.dataset.acct = acct
-  line.innerHTML = ts + wrapAccountTag(ansiToHtml(entry.text))
+  line.innerHTML = ts + wrapAccountTag(ansiToHtml(entry.text), entry.text)
   const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 60
   // 仅移除「等待任务输出」这一条占位提示；空状态提示由 updateEmptyHint 统一管理
   const placeholder = body.querySelector('.dim')
@@ -862,7 +907,7 @@ $('#btn-run-all').addEventListener('click', async () => {
     refreshStatus()
   } catch (e) {
     btn.disabled = false
-    toast(e.status === 401 ? 'admin 验证失败：账号或密码错误' : e.message, 'err')
+    toast(e.message || 'admin 验证失败：账号或密码错误', 'err')
     refreshStatus()
   }
 })

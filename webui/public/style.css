@@ -146,6 +146,10 @@ main {
 @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 
 .panel-head {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  flex-wrap: wrap;
   font-size: 15px;
   margin-bottom: 18px;
   padding-bottom: 10px;
@@ -196,7 +200,6 @@ main {
 .run-block .input { max-width: 240px; }
 
 /* 方案 B：面板标题右侧的齿轮图标按钮（管理员功能入口） */
-.panel-head { display: flex; align-items: baseline; gap: 4px; flex-wrap: wrap; }
 .icon-btn {
   margin-left: auto;
   padding: 2px 8px;

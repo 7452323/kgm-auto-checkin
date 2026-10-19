@@ -55,11 +55,32 @@ const ROOT = path.resolve(__dirname, '..')
 
 // ────────────────────────── 配置 ──────────────────────────
 
+/**
+ * 解析布尔型环境变量：只有 1/true/yes/on 视为开启。
+ * 直接写 `if (process.env.X)` 会把 "0"、"false" 这类字符串也当成开启。
+ */
+function envFlag(name) {
+  return ['1', 'true', 'yes', 'on'].includes(String(process.env[name] || '').trim().toLowerCase())
+}
+
+/**
+ * 解析 WEBUI_TRUST_PROXY：既支持布尔开关，也支持「信任的代理跳数」。
+ * 返回 false 表示不信任；true 表示信任全部；数字表示信任的跳数。
+ */
+function parseTrustProxy(raw) {
+  const s = String(raw ?? '').trim().toLowerCase()
+  if (!s || ['0', 'false', 'no', 'off'].includes(s)) return false
+  if (['true', 'yes', 'on'].includes(s)) return true
+  const hop = parseInt(s, 10)
+  return Number.isInteger(hop) && hop > 0 ? hop : false
+}
+
 const WEBUI_PORT = Number(process.env.WEBUI_PORT || 3000)
 const WEBUI_PASSWORD = String(process.env.WEBUI_PASSWORD || '').trim()
 // 仅当显式配置时才信任 X-Forwarded-For（反向代理部署）。默认关闭：
 // 无条件信任会让攻击者伪造 XFF 头绕过按 IP 的防爆破计数。
-const WEBUI_TRUST_PROXY = process.env.WEBUI_TRUST_PROXY
+const WEBUI_TRUST_PROXY_RAW = process.env.WEBUI_TRUST_PROXY
+const WEBUI_TRUST_PROXY = parseTrustProxy(WEBUI_TRUST_PROXY_RAW)
 const ACCOUNTS_PASSWORD = String(process.env.ACCOUNTS_PASSWORD || '').trim()
 const ACCOUNTS_MAX_ATTEMPTS = Math.max(1, parseInt(process.env.ACCOUNTS_MAX_ATTEMPTS || '3', 10))
 const ACCOUNTS_LOCK_MINUTES = Math.max(0.01, parseFloat(process.env.ACCOUNTS_LOCK_MINUTES || '5'))
@@ -72,16 +93,14 @@ const ACCOUNTS_IP_MAX_ATTEMPTS = Math.max(
 // 未设置密码的账号是否允许以「酷狗ID 作为默认密码」登录（默认允许，便于用户首次改密）。
 // 设为 true 可关闭该行为，此时未设密码的账号必须由 admin 先设置密码。
 // ⚠ 酷狗ID 并非秘密，开启默认密码意味着知道 ID 的人即可登录并改密，公网部署请谨慎。
-const ACCOUNTS_DISABLE_ID_DEFAULT = ['1', 'true', 'yes', 'on'].includes(
-  String(process.env.ACCOUNTS_DISABLE_ID_DEFAULT || '').trim().toLowerCase()
-)
+const ACCOUNTS_DISABLE_ID_DEFAULT = envFlag('ACCOUNTS_DISABLE_ID_DEFAULT')
 // 首次启动用于初始化 admin 的引导密码（accounts_auth.json 不存在时使用）
 const ACCOUNTS_BOOTSTRAP_PASSWORD = String(process.env.ACCOUNTS_BOOTSTRAP_PASSWORD || '').trim()
 const WEBUI_API_PORT = process.env.WEBUI_API_PORT || '3010'
 const CHECKIN_API_PORT = process.env.CHECKIN_API_PORT || '3020'
 const SCHEDULE = process.env.CRON_SCHEDULE || '10 1 * * *'
 const TIMEZONE = process.env.CRON_TIMEZONE || 'Asia/Shanghai'
-const RUN_ON_STARTUP = ['1', 'true', 'yes', 'on'].includes(String(process.env.RUN_ON_STARTUP || '').toLowerCase())
+const RUN_ON_STARTUP = envFlag('RUN_ON_STARTUP')
 const IDLE_SHUTDOWN_MS = 10 * 60 * 1000
 
 // ── 手动「立即签到」限流 ──
@@ -417,6 +436,25 @@ function broadcast(event, data) {
  * 子进程通过 API_PORT 使用独立端口拉起自己的 API 服务，与登录服务互不冲突；
  * 凭据优先取挂载卷文件内容，其次继承环境变量 USERINFO。
  */
+/**
+ * 结束一次签到：复位运行状态并广播（exit 与 spawn error 共用）。
+ * 重复调用是安全的（状态已复位也只会再广播一次结束事件）。
+ * @param {number} exitCode
+ */
+function finishCheckin(exitCode) {
+  checkinState.running = false
+  checkinState.currentOnlyUserid = null
+  checkinState.lastRun = {
+    ...checkinState.lastRun,
+    endedAt: new Date().toISOString(),
+    exitCode,
+    ok: exitCode === 0,
+    running: false,
+  }
+  pushLog(exitCode === 0 ? 'ok' : 'err', `────── 签到任务结束（退出码 ${exitCode}）──────`)
+  broadcast('end', checkinState.lastRun)
+}
+
 function startCheckin(trigger = 'manual', options = {}) {
   if (checkinState.running) return false
 
@@ -460,11 +498,19 @@ function startCheckin(trigger = 'manual', options = {}) {
   // （日志里不再刷「VIP到期时间」，避免每账号 2 行噪音）
   env.CHECKIN_STATUS_FILE = checkinStatusFile()
 
-  const child = spawn(process.execPath, [path.join(ROOT, 'main.js')], {
-    cwd: ROOT,
-    env,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  })
+  let child
+  try {
+    child = spawn(process.execPath, [path.join(ROOT, 'main.js')], {
+      cwd: ROOT,
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+  } catch (e) {
+    // 某些环境下 spawn 会同步抛错（如沙箱 EPERM）；必须复位状态，否则永久 409
+    pushLog('err', `签到进程启动失败：${e.message}`)
+    finishCheckin(1)
+    throw e
+  }
 
   // 写入凭据后立即关闭 stdin，供子进程读取
   if (userinfoRaw) {
@@ -483,22 +529,14 @@ function startCheckin(trigger = 'manual', options = {}) {
   child.stderr.on('data', onStream)
 
   child.on('error', err => {
+    // spawn 失败（EPERM/ENOMEM/EACCES 等）时子进程不会触发 exit，若不在这里复位，
+    // checkinState.running 会永久为 true，之后所有签到请求都返回 409。
     pushLog('err', `签到进程启动失败：${err.message}`)
+    finishCheckin(1)
   })
 
   child.on('exit', code => {
-    const exitCode = code ?? 1
-    checkinState.running = false
-    checkinState.currentOnlyUserid = null
-    checkinState.lastRun = {
-      ...checkinState.lastRun,
-      endedAt: new Date().toISOString(),
-      exitCode,
-      ok: exitCode === 0,
-      running: false,
-    }
-    pushLog(exitCode === 0 ? 'ok' : 'err', `────── 签到任务结束（退出码 ${exitCode}）──────`)
-    broadcast('end', checkinState.lastRun)
+    finishCheckin(code ?? 1)
   })
 
   return true
@@ -516,9 +554,8 @@ function nextRuns(n = 3) {
 const app = express()
 app.disable('x-powered-by')
 // 仅在显式配置 WEBUI_TRUST_PROXY 时才信任反向代理头（否则 XFF 可被伪造以绕过防爆破）
-if (WEBUI_TRUST_PROXY) {
-  const hop = parseInt(WEBUI_TRUST_PROXY, 10)
-  app.set('trust proxy', Number.isInteger(hop) && hop > 0 ? hop : true)
+if (WEBUI_TRUST_PROXY !== false) {
+  app.set('trust proxy', WEBUI_TRUST_PROXY)
 }
 app.use(express.json())
 app.use(express.static(path.join(__dirname, 'public')))
@@ -857,6 +894,64 @@ function accountsGuard(req, res, next) {
   })
 }
 
+/**
+ * 校验 admin 凭据，并把失败计入与 /api/accounts 相同的防爆破桶。
+ *
+ * ⚠ /api/checkin/run 的「全部账号签到」不在 accountsGuard 作用域内。若此处不计失败，
+ * 攻击者可在该端点上无限次猜解 admin 密码（两个入口共享同一份 admin 密码）。
+ * 两个入口共用 failsByIp / failsByAcct，任一入口触发锁定即全局生效。
+ *
+ * @returns {{ scope: object|null, locked: boolean, retryAfter: number, message: string }}
+ */
+function verifyAdminGuarded(req) {
+  const ip = clientIp(req)
+  const now = Date.now()
+
+  const ipSt = bucketState(failsByIp, ip)
+  if (ipSt.lockUntil > now) {
+    const left = Math.ceil((ipSt.lockUntil - now) / 1000)
+    return { scope: null, locked: true, retryAfter: left, message: `尝试次数过多，已锁定，请 ${left} 秒后再试` }
+  }
+  const acctSt = bucketState(failsByAcct, 'admin')
+  if (acctSt.lockUntil > now) {
+    const left = Math.ceil((acctSt.lockUntil - now) / 1000)
+    return { scope: null, locked: true, retryAfter: left, message: `admin 密码错误次数过多，已锁定，请 ${left} 秒后再试` }
+  }
+
+  const { id, key } = providedAccountsCreds(req)
+  if (!id || !key) {
+    // 未提供凭据不算失败（与 accountsGuard 一致）：用户可能只是先点了按钮，
+    // 否则连点几次就会把 admin 把自己锁掉。
+    return { scope: null, locked: false, retryAfter: 0, message: '全部账号签到需要管理员（admin）账号与密码验证' }
+  }
+  const scope = verifyAccountsCreds(id, key, req)
+  if (scope && scope.admin) {
+    clearFails(failsByIp, ip)
+    clearFails(failsByAcct, 'admin')
+    return { scope, locked: false, retryAfter: 0, message: '' }
+  }
+
+  // 失败：与 /api/accounts 完全一致的计数与阈值
+  const acctLocked = registerFail(failsByAcct, 'admin', ACCOUNTS_MAX_ATTEMPTS, now)
+  const ipLocked = registerFail(failsByIp, ip, ACCOUNTS_IP_MAX_ATTEMPTS, now)
+  if (acctLocked || ipLocked) {
+    printRed(`[webui] 全量签到：${ip} admin 验证连续失败，锁定 ${ACCOUNTS_LOCK_MINUTES} 分钟`)
+    return {
+      scope: null,
+      locked: true,
+      retryAfter: Math.ceil(ACCOUNTS_LOCK_MS / 1000),
+      message: `密码错误次数过多，已锁定 ${ACCOUNTS_LOCK_MINUTES} 分钟`,
+    }
+  }
+  const left = Math.max(0, ACCOUNTS_MAX_ATTEMPTS - bucketState(failsByAcct, 'admin').fails)
+  return {
+    scope: null,
+    locked: false,
+    retryAfter: 0,
+    message: `管理员账号或密码错误，剩余尝试次数 ${left}`,
+  }
+}
+
 app.use('/api/accounts', accountsGuard)
 
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
@@ -1074,13 +1169,13 @@ app.post('/api/checkin/run', wrap(async (req, res) => {
     return res.status(202).json({ ok: true, mode: 'single', userid: maskIdentifier(rawUserid), remaining: q.remaining })
   }
 
-  // ── 模式二：全部账号，必须通过 admin 验证 ──
-  const { id, key } = providedAccountsCreds(req)
-  const scope = id && key ? verifyAccountsCreds(id, key, req) : null
-  if (!scope || !scope.admin) {
-    const err = new Error('全部账号签到需要管理员（admin）账号与密码验证')
-    err.status = 401
-    err.code = 'admin-required'
+  // ── 模式二：全部账号，必须通过 admin 验证（失败计入防爆破，与 /api/accounts 共用桶） ──
+  const admin = verifyAdminGuarded(req)
+  if (!admin.scope) {
+    const err = new Error(admin.message)
+    err.status = admin.locked ? 423 : 401
+    err.code = admin.locked ? 'accounts-auth' : 'admin-required'
+    if (admin.retryAfter > 0) err.retryAfterMs = admin.retryAfter * 1000
     throw err
   }
 
@@ -1356,7 +1451,7 @@ app.listen(WEBUI_PORT, () => {
   printYellow(`  下次执行: ${nextRuns(1)[0] || '-'}`)
   printYellow(`  凭据文件: ${USERINFO_FILE}（${readUserinfo().length} 个账号）`)
   printYellow(`  访问密码: ${WEBUI_PASSWORD ? '已启用' : '未启用（仅建议在可信内网使用）'}`)
-  printYellow(`  账号管理: 每账号独立密码（scrypt）· admin ${ACCOUNTS_PASSWORD || readAccountsAuth().admin ? '已启用' : '未启用'} · 账号 ${ACCOUNTS_MAX_ATTEMPTS} 次 / IP ${ACCOUNTS_IP_MAX_ATTEMPTS} 次错误锁定 ${Math.round(ACCOUNTS_LOCK_MINUTES)} 分钟`)
+  printYellow(`  账号管理: 每账号独立密码（scrypt）· admin ${ACCOUNTS_PASSWORD || readAccountsAuth().admin ? '已启用' : '未启用'} · 账号 ${ACCOUNTS_MAX_ATTEMPTS} 次 / IP ${ACCOUNTS_IP_MAX_ATTEMPTS} 次错误锁定 ${ACCOUNTS_LOCK_MINUTES} 分钟`)
   if (ACCOUNTS_DISABLE_ID_DEFAULT) {
     printYellow('  账号默认密码: 已关闭（未设密码的账号需由 admin 设置密码后才能登录）')
   } else {
@@ -1367,12 +1462,17 @@ app.listen(WEBUI_PORT, () => {
   if (!readAccountsAuth().admin && !ACCOUNTS_PASSWORD) {
     printYellow('  提示：未配置 ACCOUNTS_PASSWORD，admin 不可用；可设 ACCOUNTS_BOOTSTRAP_PASSWORD 初始化 admin 密码')
   }
-  if (WEBUI_TRUST_PROXY) {
-    printYellow(`  反向代理: 已信任 X-Forwarded-For（WEBUI_TRUST_PROXY=${WEBUI_TRUST_PROXY}）`)
+  if (WEBUI_TRUST_PROXY !== false) {
+    printYellow(`  反向代理: 已信任 X-Forwarded-For（WEBUI_TRUST_PROXY=${WEBUI_TRUST_PROXY_RAW}）`)
   } else {
     // 未信任代理头时，公网请求会被视为来自代理内网地址，所有按 IP 的限制（含账号防爆破）都会被豁免
-    printRed('  ⚠ 未设置 WEBUI_TRUST_PROXY：经反向代理的公网请求会全部被视为内网来源，')
-    printRed('    按 IP 的限流与账号防爆破计数将被豁免；公网部署请设为 1。')
+    const raw = String(WEBUI_TRUST_PROXY_RAW ?? '').trim()
+    if (raw) {
+      printYellow(`  反向代理: 已明确关闭（WEBUI_TRUST_PROXY=${raw}），不信任 X-Forwarded-For`)
+    } else {
+      printRed('  ⚠ 未设置 WEBUI_TRUST_PROXY：经反向代理的公网请求会全部被视为内网来源，')
+      printRed('    按 IP 的限流与账号防爆破计数将被豁免；公网部署请设为 1。')
+    }
   }
   printYellow(`  验证码限流: IP ${describeRateLimit(PHONE_SEND_IP_LIMIT)} · 手机号 ${describeRateLimit(PHONE_SEND_PHONE_LIMIT)}（内网/本机豁免）`)
   printYellow(`  二维码限流: IP ${describeRateLimit(QR_GEN_IP_LIMIT)}（内网/本机豁免）`)

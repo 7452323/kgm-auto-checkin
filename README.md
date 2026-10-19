@@ -80,7 +80,7 @@ docker inspect --format '{{.State.Health.Status}}' kgcheckin
 
 ### 3. WebUI 控制台（推荐）
 
-浏览器打开 `http://<服务器IP>:3000`，即可使用终端风格的可视化控制台：
+浏览器打开 `http://<服务器IP>:14725`，即可使用终端风格的可视化控制台：
 
 | 功能 | 说明 |
 |------|------|
@@ -146,7 +146,7 @@ docker compose run --rm kgcheckin node scheduler.js once   # 或命令行方式�
 | `ACCOUNTS_MAX_ATTEMPTS` / `ACCOUNTS_LOCK_MINUTES` | `3` / `5` | 可选覆盖防爆破策略（单账号最大错误次数 / 锁定时长） |
 | `ACCOUNTS_IP_MAX_ATTEMPTS` | `ACCOUNTS_MAX_ATTEMPTS × 5` | 单个 IP 的最大错误次数（放宽以免同 NAT 用户互相影响） |
 | `ACCOUNTS_DISABLE_ID_DEFAULT` | `false` | 设为 `true` 关闭「默认密码=酷狗ID」，未设密码的账号须由 admin 先设置密码（公网部署推荐） |
-| `WEBUI_TRUST_PROXY` | - | 部署在反向代理后（Nginx/Caddy/Cloudflare Tunnel 等）时**必须**设为 `1`，以信任 `X-Forwarded-For` 取真实 IP；未设置则不信任（防伪造绕过防爆破），但公网请求会全部被视为内网来源而豁免所有按 IP 的限流 |
+| `WEBUI_TRUST_PROXY` | - | 部署在反向代理后（Nginx/Caddy/Cloudflare Tunnel 等）时**必须**设为 `1`，以信任 `X-Forwarded-For` 取真实 IP（也可填代理跳数，如 `2`）；未设置或设为 `0`/`false` 则不信任（防伪造绕过防爆破），但公网请求会全部被视为内网来源而豁免所有按 IP 的限流 |
 | `WEBUI_PHONE_SEND_IP_LIMIT` | `3/60` | 发送短信验证码的 IP 限流（"次数/分钟"，即每 IP 每小时 3 次）；设为 `0/1` 关闭 |
 | `WEBUI_PHONE_SEND_PHONE_LIMIT` | `2/1440` | 发送短信验证码的手机号限流（每号 24 小时 2 次），防止本服务被当作短信轰炸机 |
 | `WEBUI_QR_GEN_IP_LIMIT` | `1/3` | 生成登录二维码的 IP 限流（每 IP 3 分钟 1 次，每次都会向酷狗申请新 key） |
@@ -174,7 +174,7 @@ docker compose run --rm kgcheckin node scheduler.js once   # 或命令行方式�
 docker compose up -d --build                                # 构建/更新并启动
 docker compose logs -f --tail 100                           # 跟踪日志
 docker compose down                                         # 停止并删除容器
-# WebUI 控制台: http://localhost:3000 （扫码登录 / 手机号登录 / 一键签到 / 账号管理）
+# WebUI 控制台: http://localhost:14725 （扫码登录 / 手机号登录 / 一键签到 / 账号管理）
 docker compose run --rm kgcheckin node scheduler.js once    # 命令行方式手动立即签到
 docker compose run --rm kgcheckin node scheduler.js next    # 预览接下来 3 次签到时间
 docker compose run --rm kgcheckin node qrcodeLogin.js gen   # 命令行生成登录二维码
