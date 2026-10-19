@@ -1,5 +1,3 @@
-import fs from "node:fs";
-import path from "node:path";
 import { printBlue, printGreen, printMagenta, printRed, printYellow } from "./utils/colorOut.js";
 import { hasSecretWriteToken, setRepoSecret } from "./utils/githubSecrets.js";
 import { maskDisplayName, maskIdentifier, sanitizeForLog, summarizeResponse } from "./utils/safeLog.js";
@@ -8,6 +6,7 @@ import { close_api, delay, send, startService, waitForApi } from "./utils/utils.
 import { writeUserinfoFile, parseUserinfoJson } from "./utils/userinfo.js";
 import { beijingDateStr, isBeijingSunday } from "./utils/date.js";
 import { checkinStateEnabled, loadDoneToday, saveDoneToday } from "./utils/checkinState.js";
+import { mergeVipExpiries, readCheckinStatus, writeCheckinStatus } from "./utils/checkinStatus.js";
 
 /**
  * 读取进程 stdin 的全部内容（用于从父进程安全接收凭据）。
@@ -71,6 +70,13 @@ async function main() {
   const doneSet = stateEnabled ? loadDoneToday(date) : new Set()
   let skippedCount = 0
 
+  // WebUI 拉起时把各账号 VIP 到期时间写盘（供「账号管理」展示）；Actions/命令行不设置该变量。
+  const statusFile = process.env.CHECKIN_STATUS_FILE
+  // 文件里已有的映射：用于①跳过账号的到期时间刷新判断 ②写盘时与旧数据合并（绝不能整份覆盖）
+  const existingStatus = statusFile ? readCheckinStatus(statusFile) : { vipExpiry: {}, vipExpiryAt: {} }
+  // 本轮实际查到（或保留了旧值）的到期时间，写盘时与 existingStatus.vipExpiry 合并
+  const vipExpiryAt = { ...existingStatus.vipExpiryAt }
+
   const errorMsg = {}
   // 通知结果收集（并行完成后按账号原始顺序填充）
   const notifyResults = []
@@ -88,6 +94,23 @@ async function main() {
         const safeUserId = maskIdentifier(user.userid)
         printYellow(`${tag} 账号 ${safeUserId} 今日已签到，跳过`)
         skippedCount++
+        // 刷新账号管理面板的 VIP 到期时间：今日已签到的账号本轮不会再走下面的
+        // VIP 详情查询，若不补一次，面板会一直停在旧值或「未获取」。
+        // 为了避免每次手动触发都对全部已签到账号重查（跳过机制本就是为了减少请求），
+        // 仅当该账号的到期时间不是今天查到的时候才补一次。
+        if (statusFile && vipExpiryAt[String(user.userid)] !== date) {
+          try {
+            const headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
+            const vipInfo = await send(`/user/vip/detail?timestrap=${Date.now()}`, "GET", headers)
+            const end = vipInfo?.status === 1 && Array.isArray(vipInfo.data?.busi_vip) && vipInfo.data.busi_vip.length > 0
+              ? vipInfo.data.busi_vip[0].vip_end_time
+              : null
+            if (end) {
+              vipExpiries[String(user.userid)] = end
+              vipExpiryAt[String(user.userid)] = date
+            }
+          } catch { /* 刷新失败不影响跳过，保留文件里的旧值 */ }
+        }
         return {
           nickname: safeUserId, status: '跳过', listen: '今日已签到',
           vipClaim: '-', vipExpiry: '-', error: ''
@@ -216,6 +239,7 @@ async function main() {
         // 顺带记录到期时间，供 WebUI「账号管理」展示（仅在有状态文件时收集）
         if (process.env.CHECKIN_STATUS_FILE) {
           vipExpiries[String(user.userid)] = vipExpiry
+          if (vipExpiry !== '未知') vipExpiryAt[String(user.userid)] = date
         }
         return {
           nickname: safeNickname,
@@ -280,21 +304,16 @@ async function main() {
 
   // 把本轮查到的 VIP 到期时间写盘，供 WebUI「账号管理」展示。
   // 仅在 WebUI 拉起签到子进程时设置 CHECKIN_STATUS_FILE；Actions/命令行不写。
-  const statusFile = process.env.CHECKIN_STATUS_FILE
-  if (statusFile && Object.keys(vipExpiries).length > 0) {
-    try {
-      const tmp = `${statusFile}.tmp`
-      fs.mkdirSync(path.dirname(statusFile), { recursive: true })
-      fs.writeFileSync(
-        tmp,
-        JSON.stringify({ updatedAt: new Date().toISOString(), date, vipExpiry: vipExpiries }, null, 2),
-        'utf8'
-      )
-      fs.renameSync(tmp, statusFile)
-    } catch (e) {
-      // 写盘失败不影响签到结果，仅在详细模式下提示
-      printYellow(`警告：账号状态写入失败（${e.message}）`)
-    }
+  // 必须与文件里已有数据合并而不是整份覆盖：手动触发会跳过当日已签到的账号，
+  // 被跳过的账号本轮不查询 VIP 详情，覆盖写会把之前（定时任务）写好的到期时间全部抹掉。
+  if (statusFile) {
+    const result = writeCheckinStatus(statusFile, {
+      date,
+      vipExpiry: mergeVipExpiries(existingStatus.vipExpiry, vipExpiries),
+      vipExpiryAt,
+    })
+    // 写盘失败不影响签到结果，但必须显式告警，否则面板会一直停在旧值
+    if (!result.ok) printYellow(`警告：账号状态写入失败（${result.error}）`)
   }
 
   // 持久化当日已完成签到的账号（跨天自动失效），供手动触发时跳过

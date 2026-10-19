@@ -855,6 +855,9 @@ function connectSse() {
     $('#run-state').textContent = r.ok ? '// ✓ 签到完成' : `// ✗ 签到结束，退出码 ${r.exitCode}`
     toast(r.ok ? '签到任务执行成功' : `签到任务失败（退出码 ${r.exitCode}）`, r.ok ? 'ok' : 'err')
     refreshStatus()
+    // 签到结束会写盘 VIP 到期时间：若当前停在账号管理页，直接重拉列表，
+    // 否则用户会看到刚签完的账号仍显示「未获取」，必须切标签页才刷新。
+    if ($('#panel-accounts').classList.contains('active')) loadAccounts()
   })
   sse.onerror = () => {
     // 401 等致命错误会让连接进入 CLOSED；置空以便输入密码后能带密钥重建连接

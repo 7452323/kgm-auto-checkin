@@ -46,6 +46,7 @@ import { upsertUser, writeUserinfoFile, parseUserinfoJson } from '../utils/useri
 import { maskIdentifier, summarizeResponse } from '../utils/safeLog.js'
 import { printGreen, printMagenta, printRed, printYellow } from '../utils/colorOut.js'
 import { nextCronRuns } from '../utils/date.js'
+import { readVipExpiries as readVipExpiriesFromFile } from '../utils/checkinStatus.js'
 
 const require = createRequire(import.meta.url)
 const QRCode = require('qrcode')
@@ -1240,16 +1241,10 @@ function checkinStatusFile() {
   return path.join(base, 'checkin_status.json')
 }
 
-/** 读取签到状态文件中的 VIP 到期时间映射（userid -> 到期时间）。失败返回空对象。 */
+/** 读取签到状态文件中的 VIP 到期时间映射（userid -> 到期时间）。失败返回空对象。
+ *  解析逻辑与 main.js 写盘共用 utils/checkinStatus.js，避免两边格式不一致。 */
 function readVipExpiries() {
-  try {
-    const text = fs.readFileSync(checkinStatusFile(), 'utf8').replace(/^\uFEFF/, '')
-    const parsed = JSON.parse(text)
-    const map = parsed?.vipExpiry
-    return map && typeof map === 'object' ? map : {}
-  } catch {
-    return {}
-  }
+  return readVipExpiriesFromFile(checkinStatusFile())
 }
 
 /** 验证身份凭据（解锁面板用）；失败计数与锁定由 accountsGuard 统一处理 */
