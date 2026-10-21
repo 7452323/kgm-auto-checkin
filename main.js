@@ -4,6 +4,7 @@ import { maskDisplayName, maskIdentifier, sanitizeForLog, summarizeResponse } fr
 import { sendNotify } from "./utils/notify.js";
 import { close_api, delay, send, startService, waitForApi } from "./utils/utils.js";
 import { writeUserinfoFile, parseUserinfoJson } from "./utils/userinfo.js";
+import { buildDeviceCookie, migrateUserinfoDevice } from "./utils/device.js";
 import { beijingDateStr, isBeijingSunday } from "./utils/date.js";
 import { checkinStateEnabled, loadDoneToday, saveDoneToday } from "./utils/checkinState.js";
 import { mergeInvalidCreds, mergeVipExpiries, readCheckinStatus, writeCheckinStatus } from "./utils/checkinStatus.js";
@@ -49,6 +50,10 @@ async function main() {
   if (!userinfo) {
     throw new Error("未配置或 USERINFO 格式错误（应为 [{\"userid\":\"...\",\"token\":\"...\"}]）")
   }
+
+  // 存量账号兜底迁移：缺设备标识的条目补全局固定值（与 WebUI 启动迁移同一套幂等逻辑；
+  // GitHub Actions 直接读 Secret、不经 WebUI，所以这里也执行一次）
+  migrateUserinfoDevice(userinfo)
 
   // 启动服务并等待就绪（避免冷启动竞态导致首个请求失败）
   const api = startService()
@@ -104,7 +109,7 @@ async function main() {
         // 仅当该账号的到期时间不是今天查到的时候才补一次。
         if (statusFile && vipExpiryAt[String(user.userid)] !== date) {
           try {
-            const headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
+            const headers = { 'cookie': buildDeviceCookie(user, 'token=' + user.token + '; userid=' + user.userid) }
             const vipInfo = await send(`/user/vip/detail?timestrap=${Date.now()}`, "GET", headers)
             const end = vipInfo?.status === 1 && Array.isArray(vipInfo.data?.busi_vip) && vipInfo.data.busi_vip.length > 0
               ? vipInfo.data.busi_vip[0].vip_end_time
@@ -123,7 +128,7 @@ async function main() {
 
       // 单账号异常隔离：任何一个账号的请求/解析出错，只记录该账号失败，不影响其余账号继续执行
       try {
-        let headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
+        let headers = { 'cookie': buildDeviceCookie(user, 'token=' + user.token + '; userid=' + user.userid) }
         const userDetail = await send(`/user/detail?timestrap=${Date.now()}`, "GET", headers)
         if (userDetail?.data?.nickname == null) {
           const safeUserId = maskIdentifier(user.userid)
@@ -169,7 +174,7 @@ async function main() {
             printYellow(`${tag} 账号 ${safeNickname} 需要刷新token`)
             user.token = newToken
             // 用新 token 重建本次请求的 headers，使后续听歌/VIP 领取使用刷新后的凭证
-            headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
+            headers = { 'cookie': buildDeviceCookie(user, 'token=' + user.token + '; userid=' + user.userid) }
           } else if (refreshToken?.status == 1 && !newToken) {
             // 刷新接口返回成功但没给有效 token：保持原 token 继续本次签到
             printYellow(`${tag} 账号 ${safeNickname} token 刷新响应缺少有效 token，已保留原 token`)
@@ -284,20 +289,28 @@ async function main() {
   }
 
   try {
-    // 并发数（账号级并行）：默认不限制——有几个账号就几路全部并行；
-    // CHECKIN_CONCURRENCY 可选限流：设 N = 最多 N 路，设 1 = 逐个串行（与旧版行为一致）
+    // 并发数（账号级并行）：默认按账号规模自适应——≤6 个账号全部并行；
+    // 超过 6 个时默认限 3 路（多账号同 IP 高并发易触发风控），并打日志提示。
+    // CHECKIN_CONCURRENCY 显式设置时优先：设 N = 最多 N 路（'max'/'0' = 不限），设 1 = 逐个串行。
     const rawConcurrency = String(process.env.CHECKIN_CONCURRENCY || '').trim().toLowerCase()
     let CONCURRENCY
-    if (!rawConcurrency || rawConcurrency === 'max' || rawConcurrency === '0') {
+    if (!rawConcurrency) {
+      CONCURRENCY = userinfo.length > 6 ? 3 : userinfo.length
+    } else if (rawConcurrency === 'max' || rawConcurrency === '0') {
       CONCURRENCY = userinfo.length
     } else {
       const n = parseInt(rawConcurrency, 10)
       CONCURRENCY = Math.min(Math.max(1, n || 1), Math.max(1, userinfo.length))
     }
     if (userinfo.length > 1) {
-      const source = (!rawConcurrency || rawConcurrency === 'max' || rawConcurrency === '0')
-        ? '全部账号同时并行'
-        : `限流 ${CONCURRENCY} 路（CHECKIN_CONCURRENCY，1 为逐个串行）`
+      let source
+      if (!rawConcurrency) {
+        source = userinfo.length > 6 ? '账号数 > 6，默认限流 3 路' : '全部账号同时并行'
+      } else if (rawConcurrency === 'max' || rawConcurrency === '0') {
+        source = '全部账号同时并行'
+      } else {
+        source = `限流 ${CONCURRENCY} 路（CHECKIN_CONCURRENCY，1 为逐个串行）`
+      }
       printYellow(`多账号并行签到：${CONCURRENCY} 个账号同时进行（${source}）`)
     }
 

@@ -43,6 +43,7 @@ import { createRequire } from 'node:module'
 
 import { close_api, delay, send, startService, waitForApi } from '../utils/utils.js'
 import { upsertUser, writeUserinfoFile, parseUserinfoJson } from '../utils/userinfo.js'
+import { buildDeviceCookie, generateDevice, migrateUserinfoDevice } from '../utils/device.js'
 import { maskIdentifier, summarizeResponse } from '../utils/safeLog.js'
 import { printGreen, printMagenta, printRed, printYellow } from '../utils/colorOut.js'
 import { nextCronRuns } from '../utils/date.js'
@@ -400,6 +401,21 @@ function readUserinfoRaw() {
 
 function saveUserinfo(arr) {
   return writeUserinfoFile(JSON.stringify(arr))
+}
+
+/**
+ * 启动时一次性迁移：给缺少设备标识的账号条目补上全局固定标识。
+ * 修改后立即落盘（幂等：已有 device 的条目不动）。
+ */
+function migrateDevicesOnBoot() {
+  try {
+    const arr = readUserinfo()
+    const changed = migrateUserinfoDevice(arr)
+    if (changed > 0) {
+      saveUserinfo(arr)
+      printYellow(`[webui] 已为 ${changed} 个存量账号补齐设备标识（全局固定值）`)
+    }
+  } catch { /* 迁移失败不阻断启动 */ }
 }
 
 // ────────────────────────── 登录用 API 服务管理 ──────────────────────────
@@ -1074,6 +1090,38 @@ app.get('/api/expired', wrap(async (req, res) => {
 }))
 
 // ── 扫码登录 ──
+// qr/key → qr/check 之间的设备标识映射（内存暂存，重启即失效；容量上限防泄漏增长）
+const pendingQrDevices = new Map()
+const PENDING_QR_DEVICES_MAX = 100
+function rememberQrDevices(items, deviceCookies) {
+  if (pendingQrDevices.size > PENDING_QR_DEVICES_MAX) pendingQrDevices.clear()
+  for (let i = 0; i < items.length; i++) {
+    pendingQrDevices.set(items[i].key, { cookie: deviceCookies[i].cookie, device: deviceCookies[i].device })
+  }
+}
+function takeQrDevice(key) {
+  return pendingQrDevices.get(key) || null
+}
+
+// phone/send → phone/login 之间的设备标识映射（同一手机号在 10 分钟内复用同一套；
+// 超出保留期或换号重新发送时，发送步骤会覆盖为新的一套）
+const pendingPhoneDevices = new Map()
+const PENDING_PHONE_DEVICES_MAX = 100
+const PENDING_PHONE_DEVICES_TTL = 10 * 60 * 1000
+function rememberPhoneDevice(phone, device) {
+  if (pendingPhoneDevices.size > PENDING_PHONE_DEVICES_MAX) pendingPhoneDevices.clear()
+  pendingPhoneDevices.set(phone, { device, at: Date.now() })
+}
+function takePhoneDevice(phone) {
+  const hit = pendingPhoneDevices.get(phone)
+  if (!hit) return null
+  if (Date.now() - hit.at > PENDING_PHONE_DEVICES_TTL) {
+    pendingPhoneDevices.delete(phone)
+    return null
+  }
+  return hit.device
+}
+
 app.post('/api/qr/gen', wrap(async (req, res) => {
   // 每次生成都会向酷狗申请新的登录 key，按 IP 限流（内网/本机豁免）
   const qrIp = normalizeIp(clientIp(req))
@@ -1081,9 +1129,15 @@ app.post('/api/qr/gen', wrap(async (req, res) => {
 
   const number = Math.min(5, Math.max(1, parseInt(req.body?.number, 10) || 1))
   const items = []
+  // 每个二维码预生成一套设备标识：登录流程全程用它（key/check），登录成功即归该账号。
+  // 一个 key 一套，多账号同时扫码互不关联。
+  const deviceCookies = []
   await withApi(async () => {
     for (let n = 0; n < number; n++) {
-      const r = await send(`/login/qr/key?timestrap=${Date.now()}`, 'GET', {})
+      const device = generateDevice()
+      const cookie = buildDeviceCookie(device)
+      deviceCookies.push({ device, cookie })
+      const r = await send(`/login/qr/key?timestrap=${Date.now()}`, 'GET', { cookie })
       if (r?.status !== 1 || !r?.data?.qrcode) {
         // 只报 status 无法定位问题：酷狗业务失败会带 error_code（如 20006 表示
         // appid/clientver/mid/dfid 不对），本地出网/代理异常则只有 msg。
@@ -1095,12 +1149,14 @@ app.post('/api/qr/gen', wrap(async (req, res) => {
       const key = r.data.qrcode
       const url = `https://h5.kugou.com/apps/loginQRCode/html/index.html?qrcode=${key}`
       const dataUrl = await QRCode.toDataURL(url, { width: 320, margin: 2 })
-      items.push({ key, url, dataUrl })
+      items.push({ key, url, dataUrl, device: deviceCookies[n].device })
       if (number > 1 && n < number - 1) await delay(500)
     }
   })
   printMagenta(`[webui] 已生成 ${items.length} 个登录二维码，等待扫码...`)
-  res.json({ items })
+  // device 内含设备指纹（GUID/MID/DEV），不发给前端，仅服务端暂存到内存会话
+  rememberQrDevices(items, deviceCookies)
+  res.json({ items: items.map(({ key, url, dataUrl }) => ({ key, url, dataUrl })) })
 }))
 
 app.get('/api/qr/status', wrap(async (req, res) => {
@@ -1112,14 +1168,18 @@ app.get('/api/qr/status', wrap(async (req, res) => {
     throw err
   }
   const result = await withApi(async () => {
-    const r = await send(`/login/qr/check?key=${encodeURIComponent(key)}&timestrap=${Date.now()}`, 'GET', {})
+    // 用生成二维码时预生成的设备标识发 check，保证登录会话与扫码会话设备一致
+    const qrDevice = takeQrDevice(key)
+    const headers = qrDevice ? { cookie: qrDevice.cookie } : {}
+    const r = await send(`/login/qr/check?key=${encodeURIComponent(key)}&timestrap=${Date.now()}`, 'GET', headers)
     const s = r?.data?.status
     if (s === 4 && r?.data?.userid && r?.data?.token) {
-      // 登录成功：凭据写入挂载卷（追加/更新，不动已有账号）
+      // 登录成功：凭据写入挂载卷（追加/更新，不动已有账号）；设备标识用扫码会话那套
       const arr = readUserinfo()
-      upsertUser(arr, { userid: String(r.data.userid), token: String(r.data.token) }, true)
+      upsertUser(arr, { userid: String(r.data.userid), token: String(r.data.token), device: qrDevice?.device }, true)
       const saved = saveUserinfo(arr)
       if (saved) clearInvalidCredentialMark(r.data.userid)
+      pendingQrDevices.delete(key)
       return { status: 4, userid: maskIdentifier(r.data.userid), saved }
     }
     return { status: s ?? -1 }
@@ -1154,15 +1214,20 @@ app.post('/api/phone/send', wrap(async (req, res) => {
     enforceRateLimit(`sms:ip:${smsIp}`, PHONE_SEND_IP_LIMIT, '验证码发送')
     enforceRateLimit(`sms:phone:${phone}`, PHONE_SEND_PHONE_LIMIT, '该手机号的验证码发送')
   }
-  const r = await withApi(() => send(`/captcha/sent?mobile=${phone}`, 'GET', {}))
-  if (r?.status !== 1) {
-    const err = new Error(`验证码发送失败：${describeUpstreamError(r)}`)
+  // 手机号登录流程整段用同一套预生成设备标识（发送验证码 + 登录），成功后归该账号。
+  // 注意：同一手机号若中途刷新页面重新发送验证码，会换一套新设备——酷狗侧表现为
+  // 设备切换，属可接受行为（同一手机号本来就可能多设备）。
+  const phoneDevice = generateDevice()
+  rememberPhoneDevice(phone, phoneDevice)
+  const r0 = await withApi(() => send(`/captcha/sent?mobile=${phone}`, 'GET', { cookie: buildDeviceCookie(phoneDevice) }))
+  if (r0?.status !== 1) {
+    const err = new Error(`验证码发送失败：${describeUpstreamError(r0)}`)
     err.status = 502
     throw err
   }
   printGreen(`[webui] 验证码已发送至 ${phone.slice(0, 2)}*******${phone.slice(-2)}`)
   // 成功响应体也记录（脱敏后），便于短信未送达时诊断上游行为
-  printYellow(`[webui] 发送响应: ${JSON.stringify(summarizeResponse(r))}`)
+  printYellow(`[webui] 发送响应: ${JSON.stringify(summarizeResponse(r0))}`)
   res.json({ ok: true })
 }))
 
@@ -1175,12 +1240,15 @@ app.post('/api/phone/login', wrap(async (req, res) => {
     err.status = 400
     throw err
   }
-  const r = await withApi(() => send(`/login/cellphone?mobile=${phone}&code=${code}`, 'GET', {}))
+  // 复用发送验证码时的设备标识；若已过期/未发送过（如直接调用），退化为本请求新生成的一套
+  const phoneDevice = takePhoneDevice(phone) || generateDevice()
+  const r = await withApi(() => send(`/login/cellphone?mobile=${phone}&code=${code}`, 'GET', { cookie: buildDeviceCookie(phoneDevice) }))
   if (r?.status === 1 && r?.data?.userid && r?.data?.token) {
     const arr = readUserinfo()
-    upsertUser(arr, { userid: String(r.data.userid), token: String(r.data.token) }, true)
+    upsertUser(arr, { userid: String(r.data.userid), token: String(r.data.token), device: phoneDevice }, true)
     const saved = saveUserinfo(arr)
     if (saved) clearInvalidCredentialMark(r.data.userid)
+    pendingPhoneDevices.delete(phone)
     const userid = maskIdentifier(r.data.userid)
     printGreen(`[webui] 手机号登录成功，账号 ${userid} 已保存`)
     return res.json({ ok: true, userid, saved })
@@ -1359,7 +1427,7 @@ async function resolveAccountNicknames(accounts) {
       await withApi(async () => {
         for (const u of missing) {
           try {
-            const headers = { cookie: `token=${u.token}; userid=${u.userid}` }
+            const headers = { cookie: buildDeviceCookie(u, `token=${u.token}; userid=${u.userid}`) }
             const detail = await send(`/user/detail?timestrap=${Date.now()}`, 'GET', headers)
             if (detail?.data?.nickname != null) u.nickname = String(detail.data.nickname)
           } catch { /* 单账号失败跳过，保持无昵称 */ }
@@ -1541,6 +1609,8 @@ const BANNER = `
 
 // 首次启动：若配置了 ACCOUNTS_BOOTSTRAP_PASSWORD 且尚无密码文件，则初始化 admin
 bootstrapAccountsAuth()
+// 存量账号设备标识迁移（幂等）
+migrateDevicesOnBoot()
 
 app.listen(WEBUI_PORT, () => {
   console.log(BANNER)
