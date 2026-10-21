@@ -37,7 +37,7 @@ https://kg.neteaseapi.cc.cd/
 > 若登录后听歌领取失败，请到APP 活动中心->天天签到领VIP(这个活动新用户好像没有) 查看当日是否已经领取VIP。
 
 > [!CAUTION]
-> **常见错误**：
+> **Github Actions部署 常见错误**：
 > 
 > 执行签到报错未配置，为`PAT`秘钥权限设置问题，需正确设置`PAT Secret`权限并再次执行登录，**Repository secrets**处除了配置的**PAT Secret**外，成功写入**USERINFO**即可正常执行签到
 > 
@@ -77,6 +77,8 @@ docker compose logs -f        # 查看日志，Ctrl+C 退出（容器继续运�
 docker ps                       # STATUS 列显示 (healthy) 即正常
 docker inspect --format '{{.State.Health.Status}}' kgcheckin
 ```
+
+#### 参照模板 ".env.example" 新建自己本地的 ".env" 配置文件 不要在模板上修改！！！
 
 ### 3. WebUI 控制台（推荐）
 
@@ -139,7 +141,7 @@ docker compose run --rm kgcheckin node scheduler.js once   # 或命令行方式�
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `WEBUI_PORT` | `3000` | WebUI 控制台监听端口 |
+| `WEBUI_PORT` | `14725` | WebUI 控制台监听端口 |
 | `WEBUI_PASSWORD` | - | 可选访问密码；设置后所有 API 需携带密钥（公网暴露时建议设置，写在 `.env` 中） |
 | `ACCOUNTS_PASSWORD` | - | 账号管理模块 admin 管理员密码；普通账号未改过密码时以「酷狗ID」作为默认密码登录，admin 可管理所有账号 |
 | `ACCOUNTS_BOOTSTRAP_PASSWORD` | - | 首次启动且尚无密码文件时，用它初始化 admin 密码 |
