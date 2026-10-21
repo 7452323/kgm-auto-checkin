@@ -40,6 +40,22 @@ function appendSummary(markdown) {
 }
 
 /**
+ * 把本地 API 服务的失败响应拼成一行可读原因。
+ * 酷狗业务失败会带 error_code（如 20006 = appid/clientver/mid/dfid 不对）；
+ * 本地网络/代理异常只有 msg（api 侧构造的 `{ status: 0, msg }`）。
+ * @param {any} r 本地 API 返回的 JSON
+ * @returns {string} 形如 "status=0，error_code=20006，msg=err appid(srcappid) or ..."
+ */
+function formatApiFailure(r) {
+  const parts = [`status=${r?.status ?? 'unknown'}`]
+  const errorCode = r?.error_code ?? r?.errcode
+  if (errorCode !== undefined && errorCode !== null) parts.push(`error_code=${errorCode}`)
+  const msg = r?.msg || r?.error_msg || r?.message
+  if (msg) parts.push(`msg=${String(msg).slice(0, 200)}`)
+  return parts.join('，')
+}
+
+/**
  * 生成并展示单个二维码 — 展示渠道：
  *
  *   ① PNG 文件（qr/qr-N.png）：Release 直链 + HTML 内嵌双用途
@@ -179,7 +195,7 @@ async function genMode() {
       } else {
         printRed("响应内容")
         console.dir(summarizeResponse(result), { depth: null })
-        throw new Error(`获取二维码密钥失败：接口返回 status=${result.status}`)
+        throw new Error(`获取二维码密钥失败：接口返回 ${formatApiFailure(result)}`)
       }
     }
 

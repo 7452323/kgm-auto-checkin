@@ -51,6 +51,24 @@ import { clearInvalidCredential, readCheckinStatus } from '../utils/checkinStatu
 const require = createRequire(import.meta.url)
 const QRCode = require('qrcode')
 
+/**
+ * 懒加载 api 侧的设备标识工具（calculateMid / isUUIDv4）。
+ * api/ 是独立 CJS 包（依赖装在 api/node_modules）。加载失败只影响启动横幅那一行，
+ * 不能让整个 WebUI 起不来，因此返回 null 由调用方降级处理。
+ * @returns {{calculateMid: Function, isUUIDv4: Function}|null}
+ */
+let apiDeviceUtil
+function loadApiDeviceUtil() {
+  if (apiDeviceUtil !== undefined) return apiDeviceUtil
+  try {
+    const util = require('../api/util/util.js')
+    apiDeviceUtil = { calculateMid: util.calculateMid, isUUIDv4: util.isUUIDv4 }
+  } catch {
+    apiDeviceUtil = null
+  }
+  return apiDeviceUtil
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
 
@@ -285,6 +303,53 @@ function formatWait(secs) {
 function describeRateLimit(spec) {
   if (!spec || spec.count <= 0 || spec.windowMs <= 0) return '已关闭'
   return `每 ${formatWait(Math.round(spec.windowMs / 1000))} ${spec.count} 次`
+}
+
+/**
+ * 把本地 API 服务的失败响应拼成一行可读原因（用于报错文案）。
+ * 酷狗业务失败会带 error_code（如 20006 = appid/clientver/mid/dfid 不对）；
+ * 本地网络/代理异常只有 msg（api 侧构造的 `{ status: 0, msg }`）。
+ * @param {any} r 本地 API 返回的 JSON
+ * @returns {string} 形如 "status=0，error_code=20006，msg=err appid(srcappid) or ..."
+ */
+function formatApiFailure(r) {
+  const parts = [`status=${r?.status ?? 'unknown'}`]
+  const errorCode = r?.error_code ?? r?.errcode
+  if (errorCode !== undefined && errorCode !== null) parts.push(`error_code=${errorCode}`)
+  const msg = r?.msg || r?.error_msg || r?.message
+  if (msg) parts.push(`msg=${String(msg).slice(0, 200)}`)
+  return parts.join('，')
+}
+
+/**
+ * 描述当前生效的设备标识 MID（启动横幅用，脱敏展示）。
+ *
+ * 与 api/server.js 的取值规则保持一致：
+ *   1. KUGOU_API_MID 显式指定时直接使用；
+ *   2. 否则由 KUGOU_API_GUID 派生（UUID v4 先 MD5，再 calculateMid）；
+ *   3. 两者都没有时 api 每次启动随机生成 —— 设备标识不稳定，酷狗可能返回
+ *      status=0 / error_code=20006，或静默丢弃验证码短信。
+ *
+ * 注意：这里读的是本进程 process.env，也正是 utils/pickApiEnv 传给 api 子进程的值。
+ * WebUI 不自行加载 .env（Docker 部署由 docker-compose 注入变量）。
+ *
+ * @returns {{ configured: boolean, text: string }}
+ */
+function describeDeviceMid() {
+  const envMid = String(process.env.KUGOU_API_MID ?? '').trim()
+  if (envMid) return { configured: true, text: `${maskIdentifier(envMid)}（来自 KUGOU_API_MID）` }
+
+  const envGuid = String(process.env.KUGOU_API_GUID ?? '').trim()
+  if (envGuid) {
+    const util = loadApiDeviceUtil()
+    if (util) {
+      const seed = util.isUUIDv4(envGuid) ? crypto.createHash('md5').update(envGuid).digest('hex') : envGuid
+      return { configured: true, text: `${maskIdentifier(util.calculateMid(seed))}（由 KUGOU_API_GUID 派生）` }
+    }
+    return { configured: true, text: '由 KUGOU_API_GUID 派生（无法预演，详见 api 日志）' }
+  }
+
+  return { configured: false, text: '随机（未配置 KUGOU_API_GUID / KUGOU_API_MID）' }
 }
 
 /**
@@ -1020,7 +1085,10 @@ app.post('/api/qr/gen', wrap(async (req, res) => {
     for (let n = 0; n < number; n++) {
       const r = await send(`/login/qr/key?timestrap=${Date.now()}`, 'GET', {})
       if (r?.status !== 1 || !r?.data?.qrcode) {
-        const err = new Error(`获取二维码密钥失败（status=${r?.status ?? 'unknown'}）`)
+        // 只报 status 无法定位问题：酷狗业务失败会带 error_code（如 20006 表示
+        // appid/clientver/mid/dfid 不对），本地出网/代理异常则只有 msg。
+        const detail = formatApiFailure(r)
+        const err = new Error(`获取二维码密钥失败（${detail}）`)
         err.status = 502
         throw err
       }
@@ -1506,6 +1574,13 @@ app.listen(WEBUI_PORT, () => {
   }
   printYellow(`  验证码限流: IP ${describeRateLimit(PHONE_SEND_IP_LIMIT)} · 手机号 ${describeRateLimit(PHONE_SEND_PHONE_LIMIT)}（内网/本机豁免）`)
   printYellow(`  二维码限流: IP ${describeRateLimit(QR_GEN_IP_LIMIT)}（内网/本机豁免）`)
+  const deviceMid = describeDeviceMid()
+  if (deviceMid.configured) {
+    printYellow(`  设备 MID: ${deviceMid.text}`)
+  } else {
+    printRed('  ⚠ 设备 MID: 未配置（每次启动随机生成，酷狗可能返回 status=0 / error_code=20006，')
+    printRed('    验证码短信也可能被风控静默丢弃）；请在 .env 中设置 KUGOU_API_GUID 或 KUGOU_API_MID。')
+  }
   if (CHECKIN_MANUAL_COOLDOWN_MS > 0) {
     printYellow(`  手动签到限流: 同一 IP 每 ${CHECKIN_MANUAL_COOLDOWN_HOURS} 小时仅可触发一次（内网/本机豁免）`)
   } else {

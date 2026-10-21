@@ -73,6 +73,29 @@ function pickApiEnv(overrides = {}) {
   return { ...out, ...overrides }
 }
 
+/**
+ * 只转发 api 子进程 stdout 里的 [ERR] 行（按行缓冲，避免半行被截断）。
+ *
+ * api 每处理一个请求都会打 [OK]/[ERR]；全量转发会刷屏，而 [ERR] 带着酷狗返回的
+ * status / error_code，是排查「二维码 status=0」这类失败的唯一线索——之前这里
+ * 直接 `api.stdout.on('data', () => {})` 丢弃，导致 docker logs 里查不到原因。
+ *
+ * @param {NodeJS.ReadableStream} stream 子进程 stdout
+ * @param {(line: string) => void} [write] 输出函数（便于测试替换）
+ */
+function pipeApiErrors(stream, write = (line) => console.log('[api]', line)) {
+  stream.setEncoding('utf8')
+  let buffer = ''
+  stream.on('data', (chunk) => {
+    buffer += chunk
+    const lines = buffer.split('\n')
+    buffer = lines.pop() // 末尾可能是半行，留到下一块
+    for (const line of lines) {
+      if (line.includes('[ERR]')) write(line.trim())
+    }
+  })
+}
+
 /** 启动 api 服务（detached 使其成为独立进程组，便于整组强杀） */
 function startService() {
   // 直接以 node 运行 api/app.js（与 npm run apiService → node app.js 等价）：
@@ -86,11 +109,11 @@ function startService() {
     env: pickApiEnv({ PORT: apiPort() }),
   })
 
-  api.stdout.on('data', () => {})
   api.stderr.on('data', data => {
     const msg = String(data).trim()
     if (msg) console.log('[api stderr]', msg)
   })
+  pipeApiErrors(api.stdout)
   api.on('close', code => console.log(`[api] 子进程退出，code=${code}`))
 
   return api
