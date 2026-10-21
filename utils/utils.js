@@ -74,25 +74,48 @@ function pickApiEnv(overrides = {}) {
 }
 
 /**
- * 只转发 api 子进程 stdout 里的 [ERR] 行（按行缓冲，避免半行被截断）。
+ * 转发 api 子进程 stdout 里的 [ERR] 日志块（含多行续行）。
  *
- * api 每处理一个请求都会打 [OK]/[ERR]；全量转发会刷屏，而 [ERR] 带着酷狗返回的
- * status / error_code，是排查「二维码 status=0」这类失败的唯一线索——之前这里
- * 直接 `api.stdout.on('data', () => {})` 丢弃，导致 docker logs 里查不到原因。
+ * api 用 `console.log('[ERR]', url, { status, body })` 记录失败：第一行只有 URL，
+ * 酷狗返回的 error_code / msg 在随后由 Node 展开的多行对象里。只按行过滤含
+ * [ERR] 的行会把这部分丢掉，日志里照样看不到失败原因。因此这里把 [ERR] 之后
+ * 直到下一条 [OK]/[ERR] 标记之前的行都归入同一块，整体输出。
+ *
+ * 之所以不全量转发：[OK] 每个请求都打一行，签到高峰期会刷屏。
  *
  * @param {NodeJS.ReadableStream} stream 子进程 stdout
- * @param {(line: string) => void} [write] 输出函数（便于测试替换）
+ * @param {(block: string) => void} [write] 输出函数（便于测试替换）
  */
-function pipeApiErrors(stream, write = (line) => console.log('[api]', line)) {
+function pipeApiErrors(stream, write = (block) => console.log('[api]', block)) {
   stream.setEncoding('utf8')
   let buffer = ''
+  let block = null // 当前 [ERR] 日志块（数组，按行）
+  const flush = () => {
+    if (!block) return
+    const text = block.join('\n').trimEnd()
+    block = null
+    if (text) write(text)
+  }
+  const handleLine = (line) => {
+    if (line.startsWith('[ERR]')) {
+      flush()
+      block = [line]
+    } else if (line.startsWith('[OK]')) {
+      flush()
+    } else if (block) {
+      block.push(line) // [ERR] 块内的续行
+    }
+  }
   stream.on('data', (chunk) => {
     buffer += chunk
     const lines = buffer.split('\n')
     buffer = lines.pop() // 末尾可能是半行，留到下一块
-    for (const line of lines) {
-      if (line.includes('[ERR]')) write(line.trim())
-    }
+    for (const line of lines) handleLine(line)
+  })
+  stream.on('end', () => {
+    if (buffer) handleLine(buffer)
+    buffer = ''
+    flush()
   })
 }
 
