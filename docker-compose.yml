@@ -99,6 +99,18 @@ services:
       MAIL_USER: ${MAIL_USER:-}
       MAIL_PASS: ${MAIL_PASS:-}
       MAIL_TO: ${MAIL_TO:-}
+      # ── 按账号的失效邮件提醒（用户自己预留邮箱并验证，登录失效时单独通知本人）──
+      # 发件人显示名（From 头里的名称部分），默认「酷狗签到助手」
+      MAIL_FROM_NAME: ${MAIL_FROM_NAME:-}
+      # 失效邮件开关：留空=开启；设为 false/0 关闭
+      MAIL_INVALID_NOTIFY: ${MAIL_INVALID_NOTIFY:-}
+      # 同一账号的失效提醒冷却天数，默认 7（即每 7 天最多提醒一次）
+      MAIL_NOTICE_COOLDOWN_DAYS: ${MAIL_NOTICE_COOLDOWN_DAYS:-}
+      # 邮箱验证码发送限流：默认每 IP 每小时 5 次、每账号每小时 3 次（内网/本机豁免）
+      WEBUI_EMAIL_SEND_IP_LIMIT: ${WEBUI_EMAIL_SEND_IP_LIMIT:-}
+      WEBUI_EMAIL_SEND_USER_LIMIT: ${WEBUI_EMAIL_SEND_USER_LIMIT:-}
+      # WebUI 公网地址：会附加在失效邮件正文里，方便用户点开重新登录（可选）
+      WEBUI_PUBLIC_URL: ${WEBUI_PUBLIC_URL:-}
       # ── 其他（一般无需修改）──
       # PAT: ""                        # 仅当仍需把 token 刷新同步回 GitHub Secret 时才需要
       # GITHUB_REPOSITORY: ""          # 同上，需与 PAT 配合使用

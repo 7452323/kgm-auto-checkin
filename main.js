@@ -8,6 +8,7 @@ import { buildDeviceCookie, migrateUserinfoDevice } from "./utils/device.js";
 import { beijingDateStr, isBeijingSunday } from "./utils/date.js";
 import { checkinStateEnabled, loadDoneToday, saveDoneToday } from "./utils/checkinState.js";
 import { mergeInvalidCreds, mergeVipExpiries, readCheckinStatus, writeCheckinStatus } from "./utils/checkinStatus.js";
+import { sendInvalidCredentialNotices } from "./utils/mailNotice.js";
 
 /**
  * 读取进程 stdin 的全部内容（用于从父进程安全接收凭据）。
@@ -403,6 +404,30 @@ async function main() {
   // 重跑签到不会恢复（酷狗已明确返回 20018）。放在通知之前打印，日志里一眼可见。
   if (invalidCredList.length > 0) {
     printRed(`⚠ ${invalidCredList.length} 个账号登录凭据已失效，需重新登录：${invalidCredList.join('、')}`)
+  }
+
+  // 按账号发送失效邮件：只发给「自己预留过邮箱并完成验证」的用户。
+  // 这里必须用完整 userinfo（而不是 processAccount 的返回值）来取邮箱，因为
+  // token 刷新的写回可能整体覆盖数组，邮箱信息只存在于当前内存里的 userinfo。
+  // 放在 allSkipped 提前 return 之前：手动重跑时全部账号跳过，但失效账号仍需要提醒。
+  const invalidUserids = new Set(Object.keys(invalidCreds).filter(id => invalidCreds[id] !== null))
+  if (invalidUserids.size > 0) {
+    const mailTargets = userinfo.filter(u => u && invalidUserids.has(String(u.userid)))
+    try {
+      const mailResult = await sendInvalidCredentialNotices(mailTargets, {
+        date,
+        siteHint: process.env.WEBUI_PUBLIC_URL || '',
+      })
+      if (mailResult.sent > 0 || mailResult.failed > 0) {
+        printYellow(`失效邮件：已发送 ${mailResult.sent} 封、失败 ${mailResult.failed} 封、冷却跳过 ${mailResult.skipped} 个、未绑定已验证邮箱 ${mailResult.invalid} 个`)
+      }
+      if (mailResult.warn === 'mail_notice_write_failed') {
+        printYellow('失效邮件发送记录写入失败，下次运行可能重复提醒同一账号')
+      }
+    } catch (e) {
+      // 邮件是附加通知：失败不应让整个签到任务判为失败
+      printYellow(`失效邮件提醒异常: ${e.message}`)
+    }
   }
 
   // 构建通知内容（放在 secret 更新之后、错误抛出之前，确保始终执行）

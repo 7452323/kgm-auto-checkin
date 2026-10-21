@@ -24,8 +24,13 @@
  *   WEBUI_PHONE_SEND_IP_LIMIT    发送验证码的 IP 限流，格式 "次数/分钟"（默认 "3/60"，即每 IP 每小时 3 次）
  *   WEBUI_PHONE_SEND_PHONE_LIMIT 发送验证码的手机号限流，格式 "次数/分钟"（默认 "2/1440"，即每号 24 小时 2 次）
  *   WEBUI_QR_GEN_IP_LIMIT        生成登录二维码的 IP 限流，格式 "次数/分钟"（默认 "1/3"，即每 IP 3 分钟 1 次）
- *                     以上三项限流均对「内网/本机」来源豁免；反向代理部署必须正确设置 WEBUI_TRUST_PROXY，
+ *   WEBUI_EMAIL_SEND_IP_LIMIT    发送邮箱验证码的 IP 限流，格式 "次数/分钟"（默认 "5/60"）
+ *   WEBUI_EMAIL_SEND_USER_LIMIT  发送邮箱验证码的单账号限流，格式 "次数/分钟"（默认 "3/60"）
+ *                     以上各项限流均对「内网/本机」来源豁免；反向代理部署必须正确设置 WEBUI_TRUST_PROXY，
  *                     否则公网请求会被视为来自代理内网地址而全部豁免，限流形同虚设。
+ *   MAIL_FROM_NAME    邮件发件人显示名（默认「酷狗签到助手」）
+ *   MAIL_INVALID_NOTIFY  是否在账号登录凭据失效时给该账号绑定的邮箱发提醒（默认开启，设 false 关闭）
+ *   MAIL_NOTICE_COOLDOWN_DAYS 同一账号的失效提醒最小间隔天数（默认 7）
  *   CRON_SCHEDULE     签到计划任务（默认 "10 1 * * *"，每天北京时间 01:10）
  *   CRON_TIMEZONE     调度时区（默认 Asia/Shanghai）
  *   RUN_ON_STARTUP    "true" 时容器启动后立即执行一次签到
@@ -44,10 +49,20 @@ import { createRequire } from 'node:module'
 import { close_api, delay, send, startService, waitForApi } from '../utils/utils.js'
 import { upsertUser, writeUserinfoFile, parseUserinfoJson } from '../utils/userinfo.js'
 import { buildDeviceCookie, generateDevice, migrateUserinfoDevice } from '../utils/device.js'
-import { maskIdentifier, summarizeResponse } from '../utils/safeLog.js'
+import { maskEmail, maskIdentifier, summarizeResponse } from '../utils/safeLog.js'
 import { printGreen, printMagenta, printRed, printYellow } from '../utils/colorOut.js'
 import { nextCronRuns } from '../utils/date.js'
 import { clearInvalidCredential, readCheckinStatus } from '../utils/checkinStatus.js'
+import {
+  buildEmailCodeMail,
+  clearMailNotice,
+  genEmailCode,
+  invalidNotifyEnabled,
+  isValidEmail,
+  mailConfigReady,
+  noticeCooldownMs,
+  sendAccountMail,
+} from '../utils/mailNotice.js'
 
 const require = createRequire(import.meta.url)
 const QRCode = require('qrcode')
@@ -250,6 +265,10 @@ function parseRateSpec(raw, defCount, defMinutes) {
 const PHONE_SEND_IP_LIMIT = parseRateSpec(process.env.WEBUI_PHONE_SEND_IP_LIMIT, 3, 60)
 const PHONE_SEND_PHONE_LIMIT = parseRateSpec(process.env.WEBUI_PHONE_SEND_PHONE_LIMIT, 2, 24 * 60)
 const QR_GEN_IP_LIMIT = parseRateSpec(process.env.WEBUI_QR_GEN_IP_LIMIT, 1, 3)
+// 邮箱验证码会真实发出邮件：既按 IP 限制（防单机刷量），也按目标账号限制
+// （防止针对某个账号反复触发，把别人的收件箱当靶子）。
+const EMAIL_SEND_IP_LIMIT = parseRateSpec(process.env.WEBUI_EMAIL_SEND_IP_LIMIT, 5, 60)
+const EMAIL_SEND_USER_LIMIT = parseRateSpec(process.env.WEBUI_EMAIL_SEND_USER_LIMIT, 3, 60)
 
 // key -> 窗口内命中时间戳数组（递增）。桶数超过 RATE_MAP_MAX 时清理过期桶，避免内存无限增长。
 const rateBuckets = new Map()
@@ -754,6 +773,43 @@ function clearFails(map, key) {
   if (st) { st.fails = 0; st.lockUntil = 0 }
 }
 
+/** ── 邮箱绑定票根 ──
+ * 用户刚刚扫码 / 短信登录成功时，服务端签发一张短期票根，前端带着它调用邮箱接口，
+ * 就无需再输入一次账号密码。票根只对「该登录成功的账号」有效，且：
+ *   - 24 字节随机数，无法猜测；
+ *   - 10 分钟过期（够用户收完邮件再回来填验证码）；
+ *   - 只存在内存里，进程重启即全部失效（重启后重新登录即可）。
+ */
+const BIND_TICKETS = new Map()
+const BIND_TICKET_TTL_MS = 10 * 60 * 1000
+const BIND_TICKETS_MAX = 500
+
+/** 为刚登录成功的账号签发票根，返回随机串 */
+function issueBindTicket(userid) {
+  const now = Date.now()
+  // 惰性清理：过期条目 + 容量上限，避免内存随登录次数无界增长
+  if (BIND_TICKETS.size > BIND_TICKETS_MAX) {
+    for (const [k, v] of BIND_TICKETS) {
+      if (v.expiresAt <= now) BIND_TICKETS.delete(k)
+    }
+    if (BIND_TICKETS.size > BIND_TICKETS_MAX) BIND_TICKETS.clear()
+  }
+  const token = crypto.randomBytes(24).toString('hex')
+  BIND_TICKETS.set(token, { userid: String(userid), expiresAt: now + BIND_TICKET_TTL_MS })
+  return token
+}
+
+/** 解析票根；无效/过期返回 null */
+function readBindTicket(token) {
+  const hit = BIND_TICKETS.get(String(token || ''))
+  if (!hit) return null
+  if (Date.now() > hit.expiresAt) {
+    BIND_TICKETS.delete(String(token))
+    return null
+  }
+  return hit
+}
+
 /** ── 每账号独立密码 + admin 管理员 ──
  * 密码哈希存于凭据同目录的 accounts_auth.json。
  * 存储格式：{ "<userid>": { algo:'scrypt', salt:'<hex>', hash:'<hex>' } }
@@ -892,6 +948,30 @@ function verifyAccountsCreds(id, key, req) {
 function accountsGuard(req, res, next) {
   const ip = clientIp(req)
   const now = Date.now()
+
+  // 登录成功后签发的一次性票根可免密码通过：用户刚扫码/短信登录成功，
+  // 此时让他再输一遍账号密码才能绑定邮箱是多余的门槛。
+  // 票根本身就是登录凭据（随机 24 字节、10 分钟有效、仅对该账号有效），
+  // 因此不降低安全性；密码路径的失败计数仍然照常工作。
+  // 票根只放行「邮箱绑定」相关接口：登录凭据能证明本人身份，但不应顺带获得
+  // 改密码 / 删除账号等面板权限（那些仍要求账号密码）。
+  const bindTicket = String(req.body?.ticket ?? req.query?.ticket ?? '').trim()
+  const isEmailPath = req.path.startsWith('/email/')
+  if (bindTicket && isEmailPath) {
+    const hit = readBindTicket(bindTicket)
+    if (hit) {
+      req.accountsScope = { admin: false, userid: hit.userid, viaTicket: true }
+      return next()
+    }
+    // 票根过期/无效时必须直接报错，不能继续走下面的账号密码兜底：
+    // 浏览器里可能还留着「上一次解锁的另一个账号」的凭据，兜底成功就会把用户在
+    // 「账号 A」弹窗里填的邮箱悄悄绑到账号 B 上，属于错绑而非报错。
+    return res.status(401).json({
+      error: '登录票根已失效（10 分钟内有效），请重新登录该账号，或到「账号管理」解锁后再绑定邮箱',
+      code: 'bind-ticket-expired',
+    })
+  }
+
   const ipSt = bucketState(failsByIp, ip)
 
   // 锁定期间一律拒绝（即使密码正确，防止绕过冷却继续尝试）
@@ -1176,11 +1256,13 @@ app.get('/api/qr/status', wrap(async (req, res) => {
     if (s === 4 && r?.data?.userid && r?.data?.token) {
       // 登录成功：凭据写入挂载卷（追加/更新，不动已有账号）；设备标识用扫码会话那套
       const arr = readUserinfo()
-      upsertUser(arr, { userid: String(r.data.userid), token: String(r.data.token), device: qrDevice?.device }, true)
+      const loggedUserid = String(r.data.userid)
+      upsertUser(arr, { userid: loggedUserid, token: String(r.data.token), device: qrDevice?.device }, true)
       const saved = saveUserinfo(arr)
-      if (saved) clearInvalidCredentialMark(r.data.userid)
+      if (saved) clearInvalidCredentialMark(loggedUserid)
       pendingQrDevices.delete(key)
-      return { status: 4, userid: maskIdentifier(r.data.userid), saved }
+      // 票根：前端拿到它就能立刻为该账号绑定通知邮箱，不必再输一次账号密码
+      return { status: 4, userid: maskIdentifier(loggedUserid), saved, bindTicket: issueBindTicket(loggedUserid) }
     }
     return { status: s ?? -1 }
   })
@@ -1245,13 +1327,15 @@ app.post('/api/phone/login', wrap(async (req, res) => {
   const r = await withApi(() => send(`/login/cellphone?mobile=${phone}&code=${code}`, 'GET', { cookie: buildDeviceCookie(phoneDevice) }))
   if (r?.status === 1 && r?.data?.userid && r?.data?.token) {
     const arr = readUserinfo()
-    upsertUser(arr, { userid: String(r.data.userid), token: String(r.data.token), device: phoneDevice }, true)
+    const loggedUserid = String(r.data.userid)
+    upsertUser(arr, { userid: loggedUserid, token: String(r.data.token), device: phoneDevice }, true)
     const saved = saveUserinfo(arr)
-    if (saved) clearInvalidCredentialMark(r.data.userid)
+    if (saved) clearInvalidCredentialMark(loggedUserid)
     pendingPhoneDevices.delete(phone)
-    const userid = maskIdentifier(r.data.userid)
+    const userid = maskIdentifier(loggedUserid)
     printGreen(`[webui] 手机号登录成功，账号 ${userid} 已保存`)
-    return res.json({ ok: true, userid, saved })
+    // 票根：前端拿到它就能立刻为该账号绑定通知邮箱
+    return res.json({ ok: true, userid, saved, bindTicket: issueBindTicket(loggedUserid) })
   }
   if (r?.error_code === 34175) {
     const err = new Error('该手机号绑定了多个酷狗账号，暂不支持手机号登录，请使用扫码登录')
@@ -1478,11 +1562,18 @@ app.get('/api/accounts', wrap(async (req, res) => {
       // 登录凭据是否已失效（酷狗返回 20018）：true 时面板提示「需重新登录」，重新登录成功后自动清除
       credentialInvalid: Boolean(invalidCreds[String(u.userid)]),
       credentialInvalidAt: invalidCreds[String(u.userid)] || null,
+      // 通知邮箱：面板整体受独立密码保护（与完整 userid 同理），故返回完整地址供用户核对；
+      // 日志与对外接口（/api/expired）一律使用 maskEmail 脱敏，不得输出完整邮箱。
+      email: u.email ? String(u.email) : null,
+      emailVerified: u.emailVerified === true,
+      emailVerifiedAt: u.emailVerifiedAt ? String(u.emailVerifiedAt) : null,
     })),
     admin: scope.admin,
     lockEnabled: true,
     // 以默认密码（酷狗ID）登录时为 true，前端据此提示尽快改密
     mustChangePassword: Boolean(scope.mustChangePassword),
+    // SMTP 是否可用：未配置时前端隐藏「绑定邮箱」入口并提示先配置 MAIL_*，避免用户白填
+    mailConfigured: mailConfigReady(),
   })
 }))
 
@@ -1582,6 +1673,209 @@ app.post('/api/accounts/password', wrap(async (req, res) => {
   res.json({ ok: true })
 }))
 
+// ── 通知邮箱绑定（每个账号绑定自己的邮箱，凭据失效时按账号发信）──
+//
+// 设计要点：
+//   1. 必须验证：验证码发到所填邮箱，填回来才落库。否则任何能调用接口的人都能
+//      把别人的邮箱绑到自己的账号上，变成对第三方的骚扰通道。
+//   2. 只绑定「自己」：admin 可以代任意账号操作（便于批量维护），普通用户与票根
+//      只能操作自己那个 userid。
+//   3. 验证码只存 sha256 哈希，10 分钟过期，最多尝试 5 次；不落盘（进程重启即作废，
+//      用户重新获取即可）。
+
+const EMAIL_CODE_TTL_MS = 10 * 60 * 1000
+const EMAIL_CODE_MAX_ATTEMPTS = 5
+const EMAIL_CODES_MAX = 2000
+
+/** userid -> { email, codeHash, expiresAt, attempts } */
+const emailCodes = new Map()
+
+/** 哈希验证码（避免把明文码留在内存/可能的转储里） */
+function hashEmailCode(code) {
+  return crypto.createHash('sha256').update(`kgcheckin-mail:${code}`).digest('hex')
+}
+
+/**
+ * 解析本次邮箱操作的目标账号。
+ *
+ * 路由挂在 /api/accounts/email/* 下，accountsGuard 已经先跑过：
+ *   - 密码路径：req.accountsScope = { admin, userid }
+ *   - 票根路径：req.accountsScope = { admin:false, userid, viaTicket:true }
+ * 所以这里只需要处理「admin 代他人操作」与「缺少目标」两种情况。
+ * @returns {string} 目标 userid
+ */
+function resolveEmailTarget(req) {
+  const scope = req.accountsScope
+  if (!scope) {
+    const err = new Error('需要先登录账号或解锁账号管理')
+    err.status = 401
+    err.code = 'accounts-auth'
+    throw err
+  }
+  const target = req.body?.targetUserid != null ? String(req.body.targetUserid).trim() : ''
+  if (scope.admin && target) {
+    if (!readUserinfo().some(u => String(u.userid) === target)) {
+      const err = new Error('目标账号不存在')
+      err.status = 404
+      throw err
+    }
+    return target
+  }
+  if (scope.userid) return String(scope.userid)
+  const err = new Error('缺少目标账号（admin 需指定 targetUserid）')
+  err.status = 400
+  throw err
+}
+
+/** 发送验证码 */
+app.post('/api/accounts/email/code', wrap(async (req, res) => {
+  const email = String(req.body?.email || '').trim()
+  if (!isValidEmail(email)) {
+    const err = new Error('邮箱格式不正确')
+    err.status = 400
+    throw err
+  }
+  if (!mailConfigReady()) {
+    const err = new Error('服务端尚未配置 SMTP（MAIL_HOST / MAIL_USER / MAIL_PASS），暂时无法发送验证码')
+    err.status = 503
+    err.code = 'mail-not-configured'
+    throw err
+  }
+
+  const targetUserid = resolveEmailTarget(req)
+
+  // 双重限流：IP 防刷量，账号防「针对某人反复发信」（内网/本机豁免）
+  const ip = normalizeIp(clientIp(req))
+  if (!isPrivateIp(ip)) {
+    enforceRateLimit(`mail:ip:${ip}`, EMAIL_SEND_IP_LIMIT, '邮箱验证码发送')
+    enforceRateLimit(`mail:user:${targetUserid}`, EMAIL_SEND_USER_LIMIT, '该账号的邮箱验证码发送')
+  }
+
+  const code = genEmailCode()
+  const account = readUserinfo().find(u => String(u.userid) === targetUserid)
+  const accountLabel = account?.nickname
+    ? `${account.nickname}（${maskIdentifier(targetUserid)}）`
+    : maskIdentifier(targetUserid)
+  const mail = buildEmailCodeMail({ code, expireMinutes: EMAIL_CODE_TTL_MS / 60000, accountLabel })
+
+  const ok = await sendAccountMail({ to: email, ...mail })
+  if (!ok) {
+    const err = new Error('验证码邮件发送失败，请检查邮箱地址或稍后重试')
+    err.status = 502
+    err.code = 'mail-send-failed'
+    throw err
+  }
+
+  // 同一账号只保留最新一次验证码：旧码立即作废，避免多封邮件里的码都能用
+  if (emailCodes.size > EMAIL_CODES_MAX) {
+    const now = Date.now()
+    for (const [k, v] of emailCodes) if (v.expiresAt <= now) emailCodes.delete(k)
+    if (emailCodes.size > EMAIL_CODES_MAX) emailCodes.clear()
+  }
+  emailCodes.set(targetUserid, {
+    email,
+    codeHash: hashEmailCode(code),
+    expiresAt: Date.now() + EMAIL_CODE_TTL_MS,
+    attempts: 0,
+  })
+
+  printGreen(`[webui] 邮箱验证码已发送至 ${maskEmail(email)}（账号 ${maskIdentifier(targetUserid)}）`)
+  res.json({
+    ok: true,
+    email: maskEmail(email),
+    expireMinutes: EMAIL_CODE_TTL_MS / 60000,
+  })
+}))
+
+/** 校验验证码并落库 */
+app.post('/api/accounts/email/verify', wrap(async (req, res) => {
+  const code = String(req.body?.code || '').trim()
+  if (!/^\d{6}$/.test(code)) {
+    const err = new Error('验证码格式不正确（6 位数字）')
+    err.status = 400
+    throw err
+  }
+  const targetUserid = resolveEmailTarget(req)
+  const pending = emailCodes.get(targetUserid)
+  if (!pending) {
+    const err = new Error('请先获取邮箱验证码')
+    err.status = 400
+    err.code = 'email-code-missing'
+    throw err
+  }
+  if (Date.now() > pending.expiresAt) {
+    emailCodes.delete(targetUserid)
+    const err = new Error('验证码已过期，请重新获取')
+    err.status = 400
+    err.code = 'email-code-expired'
+    throw err
+  }
+  if (pending.attempts >= EMAIL_CODE_MAX_ATTEMPTS) {
+    emailCodes.delete(targetUserid)
+    const err = new Error('验证码错误次数过多，请重新获取')
+    err.status = 429
+    err.code = 'email-code-too-many-attempts'
+    throw err
+  }
+  // 计时安全比较（先各自 sha256，等长后再比）
+  if (!safeEqual(hashEmailCode(code), pending.codeHash)) {
+    pending.attempts++
+    const left = EMAIL_CODE_MAX_ATTEMPTS - pending.attempts
+    const err = new Error(left > 0 ? `验证码不正确，剩余尝试次数 ${left}` : '验证码错误次数过多，请重新获取')
+    err.status = left > 0 ? 400 : 429
+    throw err
+  }
+
+  // 验证通过：写入凭据文件的账号条目（其它字段原样保留）
+  const arr = readUserinfo()
+  const account = arr.find(u => String(u.userid) === targetUserid)
+  if (!account) {
+    const err = new Error('账号不存在')
+    err.status = 404
+    throw err
+  }
+  const prevEmail = String(account.email || '').trim().toLowerCase()
+  account.email = pending.email
+  account.emailVerified = true
+  account.emailVerifiedAt = new Date().toISOString()
+  if (!saveUserinfo(arr)) {
+    const err = new Error('邮箱写入失败，请检查凭据目录权限')
+    err.status = 500
+    throw err
+  }
+  emailCodes.delete(targetUserid)
+  // 换了新邮箱才重置提醒冷却：旧地址可能已经收不到了，新地址应当能立刻收到下一封。
+  // 重复验证同一个地址不能清冷却，否则用户只要重填一次就能绕过「7 天最多一封」。
+  if (prevEmail !== pending.email.toLowerCase()) clearMailNotice(targetUserid)
+
+  printGreen(`[webui] 账号 ${maskIdentifier(targetUserid)} 已绑定并验证邮箱 ${maskEmail(pending.email)}`)
+  res.json({ ok: true, email: pending.email, emailVerified: true })
+}))
+
+/** 解绑邮箱（用户主动取消通知，或邮箱填错需要重来） */
+app.post('/api/accounts/email/unbind', wrap(async (req, res) => {
+  const targetUserid = resolveEmailTarget(req)
+  const arr = readUserinfo()
+  const account = arr.find(u => String(u.userid) === targetUserid)
+  if (!account) {
+    const err = new Error('账号不存在')
+    err.status = 404
+    throw err
+  }
+  delete account.email
+  delete account.emailVerified
+  delete account.emailVerifiedAt
+  if (!saveUserinfo(arr)) {
+    const err = new Error('邮箱解绑失败，请检查凭据目录权限')
+    err.status = 500
+    throw err
+  }
+  emailCodes.delete(targetUserid)
+  clearMailNotice(targetUserid)
+  printYellow(`[webui] 账号 ${maskIdentifier(targetUserid)} 已解绑通知邮箱`)
+  res.json({ ok: true })
+}))
+
 // ── 兜底 ──
 app.use('/api', (req, res) => res.status(404).json({ error: '接口不存在' }))
 // eslint-disable-next-line no-unused-vars
@@ -1644,6 +1938,12 @@ app.listen(WEBUI_PORT, () => {
   }
   printYellow(`  验证码限流: IP ${describeRateLimit(PHONE_SEND_IP_LIMIT)} · 手机号 ${describeRateLimit(PHONE_SEND_PHONE_LIMIT)}（内网/本机豁免）`)
   printYellow(`  二维码限流: IP ${describeRateLimit(QR_GEN_IP_LIMIT)}（内网/本机豁免）`)
+  if (mailConfigReady()) {
+    const bound = readUserinfo().filter(u => u && u.email && u.emailVerified === true).length
+    printYellow(`  通知邮箱: 已配置 SMTP · ${bound} 个账号已验证邮箱 · 失效提醒 ${invalidNotifyEnabled() ? '开启' : '关闭'}（同一账号冷却 ${Math.round(noticeCooldownMs() / 86400000)} 天）`)
+  } else {
+    printYellow('  通知邮箱: 未配置 SMTP（MAIL_HOST / MAIL_USER / MAIL_PASS），无法绑定邮箱与发送失效提醒')
+  }
   const deviceMid = describeDeviceMid()
   if (deviceMid.configured) {
     printYellow(`  设备 MID: ${deviceMid.text}`)

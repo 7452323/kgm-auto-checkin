@@ -218,6 +218,8 @@ function showAccountsLock(msg, isErr) {
 let accountsCache = []
 let accountsAdmin = false
 let accountsSearch = ''
+/** 服务端是否配置了 SMTP：没配置就不让人点「绑定邮箱」，否则只会收到 503 */
+let mailConfigured = false
 
 /**
  * 按昵称或酷狗ID 过滤账号。
@@ -235,9 +237,10 @@ function filterAccounts(list, keyword) {
   })
 }
 
-function renderAccounts(accounts, admin, mustChangePassword) {
+function renderAccounts(accounts, admin, mustChangePassword, serverMailConfigured) {
   accountsCache = accounts
   accountsAdmin = admin
+  mailConfigured = serverMailConfigured === true
   // 以默认密码（酷狗ID）登录：提示尽快修改，避免他人凭 ID 登录并改密
   const warn = $('#accounts-default-pwd-warn')
   if (warn) {
@@ -245,6 +248,14 @@ function renderAccounts(accounts, admin, mustChangePassword) {
     warn.textContent = mustChangePassword
       ? '⚠ 当前使用的是默认密码（酷狗ID）。酷狗ID 对他人可见，请立即点击「修改密码」设置自己的密码。'
       : ''
+  }
+  // SMTP 未配置：先在面板顶部说明，避免用户逐个点「绑定邮箱」才发现不可用
+  const mailWarn = $('#accounts-mail-warn')
+  if (mailWarn) {
+    mailWarn.hidden = mailConfigured
+    mailWarn.textContent = mailConfigured
+      ? ''
+      : '⚠ 服务端未配置 SMTP（MAIL_HOST / MAIL_USER / MAIL_PASS）：无法绑定通知邮箱，登录失效时也不会发邮件。'
   }
   renderAccountList()
   updateExpiredBadge()
@@ -299,6 +310,10 @@ function renderAccountList() {
     const vipHtml = acct.vipExpiry
       ? `<div class="acct-sub">VIP 到期: <span class="vip-expiry">${escapeHtml(String(acct.vipExpiry))}</span></div>`
       : '<div class="acct-sub dim">VIP 到期: 未获取（下次签到后显示）</div>'
+    // 通知邮箱：绑定的目的只是「凭据失效时能联系到本人」，没绑也不影响签到
+    const mailHint = acct.email && acct.emailVerified
+      ? `<div class="acct-sub">通知邮箱: <span class="acct-mail">${escapeHtml(String(acct.email))}</span> ✓ 已验证</div>`
+      : '<div class="acct-sub dim">通知邮箱: 未绑定（登录失效时不会收到邮件）</div>'
     // userid 完整显示（面板本身受独立密码保护）；搜索高亮匹配片段
     const idHtml = highlightMatch(String(acct.userid), accountsSearch)
     div.innerHTML = `
@@ -307,8 +322,51 @@ function renderAccountList() {
         <div class="acct-sub">token: ****（${acct.tokenLength} 字符）· 每周日签到时自动刷新</div>
         ${invalidHint}
         ${vipHtml}
+        ${mailHint}
         ${noPwdHint}
       </div>`
+    // 操作区：邮箱绑定 + 删除，竖排避免挤占账号信息
+    const actions = document.createElement('div')
+    actions.className = 'acct-actions'
+
+    const mailBtn = document.createElement('button')
+    mailBtn.className = 'btn ghost'
+    mailBtn.textContent = acct.email && acct.emailVerified ? '[ 更换邮箱 ]' : '[ 绑定邮箱 ]'
+    if (!mailConfigured) {
+      mailBtn.disabled = true
+      mailBtn.title = '服务端未配置 SMTP（MAIL_HOST / MAIL_USER / MAIL_PASS）'
+    }
+    mailBtn.addEventListener('click', async () => {
+      // 验证成功后 askEmailBind 内部已刷新账号列表，这里不再重复请求
+      await askEmailBind({
+        userid: acct.userid,
+        targetUserid: accountsAdmin ? String(acct.rawUserid) : undefined,
+        currentEmail: acct.email || '',
+      })
+    })
+    actions.appendChild(mailBtn)
+
+    if (acct.email && acct.emailVerified) {
+      const unBtn = document.createElement('button')
+      unBtn.className = 'btn ghost'
+      unBtn.textContent = '[ 解绑 ]'
+      unBtn.addEventListener('click', async () => {
+        if (!confirm(`确认解绑账号 ${acct.userid} 的通知邮箱？解绑后失效时不再发邮件。`)) return
+        try {
+          await api('/api/accounts/email/unbind', {
+            method: 'POST',
+            body: JSON.stringify(accountsAdmin ? { targetUserid: String(acct.rawUserid) } : {}),
+          })
+          toast('邮箱已解绑', 'ok')
+          loadAccounts()
+        } catch (e) {
+          if (e.status === 423) lockdownAccounts(e.data && e.data.retryAfter, e.message)
+          else toast(e.message, 'err')
+        }
+      })
+      actions.appendChild(unBtn)
+    }
+
     const btn = document.createElement('button')
     btn.className = 'btn danger-ghost'
     btn.textContent = '[ 删除 ]'
@@ -325,7 +383,8 @@ function renderAccountList() {
         else toast(e.message, 'err')
       }
     })
-    div.appendChild(btn)
+    actions.appendChild(btn)
+    div.appendChild(actions)
     box.appendChild(div)
   })
 }
@@ -375,7 +434,7 @@ async function loadAccounts() {
   clearInterval(accountsTimer)
   try {
     const r = await api('/api/accounts')
-    renderAccounts(r.accounts, r.admin, r.mustChangePassword)
+    renderAccounts(r.accounts, r.admin, r.mustChangePassword, r.mailConfigured)
   } catch (e) {
     if (e.status === 423) {
       lockdownAccounts(e.data && e.data.retryAfter, e.message)
@@ -457,6 +516,121 @@ $('#btn-accounts-passwd').addEventListener('click', async () => {
   }
 })
 
+/* ────────────────── 通知邮箱（预留 + 验证）────────────────── */
+
+// 当前弹窗的目标账号。来自两处：
+//   1. 登录成功后的票根（ticket）——用户无需再输账号密码
+//   2. 账号管理面板（已解锁，api() 自动带 X-Accounts-Id/Key）
+let emailCtx = null
+let emailResolve = null
+
+/**
+ * 打开「预留通知邮箱」弹窗。
+ * @param {{userid?: string, ticket?: string, targetUserid?: string, currentEmail?: string|null}} ctx
+ * @returns {Promise<boolean>} 是否完成了绑定（跳过/关闭为 false）
+ */
+function askEmailBind(ctx) {
+  // 弹窗已在等待中：先结束上一个，避免 Promise 永久悬挂
+  if (emailResolve) resolveEmailDialog(false)
+  emailCtx = ctx || {}
+  $('#email-input').value = emailCtx.currentEmail || ''
+  $('#email-code').value = ''
+  $('#email-code-row').hidden = true
+  $('#btn-email-verify').disabled = true
+  $('#email-msg').textContent = ''
+  $('#email-msg').className = 'tip'
+  $('#email-hint').textContent = emailCtx.userid
+    ? `// 账号 ${emailCtx.userid}：留下邮箱，登录凭据失效时通知你重新登录（可跳过）`
+    : '// 留下邮箱，登录凭据失效时通知你重新登录（可跳过）'
+  emailResolve = null
+  const p = new Promise(resolve => { emailResolve = resolve })
+  $('#email-dialog').showModal()
+  return p
+}
+
+function resolveEmailDialog(ok) {
+  if ($('#email-dialog').open) $('#email-dialog').close()
+  const r = emailResolve
+  emailResolve = null
+  emailCtx = null
+  if (r) r(ok)
+}
+
+function setEmailMsg(text, isErr) {
+  const el = $('#email-msg')
+  el.textContent = text || ''
+  el.className = isErr ? 'tip err' : 'tip'
+}
+
+/** 把弹窗上下文转成接口 body（票根 / 面板凭据 / admin 指定目标二选一） */
+function emailBody(extra) {
+  const body = { ...(extra || {}) }
+  if (emailCtx && emailCtx.ticket) body.ticket = emailCtx.ticket
+  if (emailCtx && emailCtx.targetUserid) body.targetUserid = emailCtx.targetUserid
+  return body
+}
+
+$('#btn-email-send-code').addEventListener('click', async () => {
+  const btn = $('#btn-email-send-code')
+  const email = $('#email-input').value.trim()
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
+    setEmailMsg('// 邮箱格式不正确', true)
+    return
+  }
+  btn.disabled = true
+  setEmailMsg('// 正在发送…')
+  try {
+    const r = await api('/api/accounts/email/code', {
+      method: 'POST',
+      body: JSON.stringify(emailBody({ email })),
+    })
+    $('#email-code-row').hidden = false
+    $('#btn-email-verify').disabled = false
+    setEmailMsg(`// 验证码已发送至 ${r.email}，${r.expireMinutes} 分钟内有效`)
+    cooldownButton(btn, 60, '[ 发送验证码 ]')
+    $('#email-code').focus()
+  } catch (e) {
+    setEmailMsg(`// ${e.message}`, true)
+    // 服务端限流：按真实剩余时间冷却，避免连点
+    if (e.status === 429 && e.data && e.data.retryAfter) {
+      cooldownButton(btn, e.data.retryAfter, '[ 发送验证码 ]')
+    } else {
+      btn.disabled = false
+    }
+  }
+})
+
+$('#btn-email-verify').addEventListener('click', async () => {
+  const btn = $('#btn-email-verify')
+  const code = $('#email-code').value.trim()
+  if (!/^\d{6}$/.test(code)) {
+    setEmailMsg('// 请输入 6 位数字验证码', true)
+    return
+  }
+  btn.disabled = true
+  setEmailMsg('// 正在验证…')
+  try {
+    const r = await api('/api/accounts/email/verify', {
+      method: 'POST',
+      body: JSON.stringify(emailBody({ code })),
+    })
+    toast(`邮箱 ${r.email} 已验证，失效时会通知你`, 'ok')
+    resolveEmailDialog(true)
+    // 面板里操作时同步刷新列表，显示新的邮箱状态
+    if (!$('#accounts-content').hidden) loadAccounts()
+  } catch (e) {
+    setEmailMsg(`// ${e.message}`, true)
+    btn.disabled = false
+  }
+})
+
+$('#email-code').addEventListener('keydown', e => {
+  if (e.key === 'Enter') $('#btn-email-verify').click()
+})
+$('#btn-email-skip').addEventListener('click', () => resolveEmailDialog(false))
+// Esc：按「跳过」处理，避免 Promise 悬挂
+$('#email-dialog').addEventListener('cancel', e => { e.preventDefault(); resolveEmailDialog(false) })
+
 /* ────────────────── 扫码登录 ────────────────── */
 
 let qrPolling = false
@@ -527,6 +701,8 @@ function startQrPolling() {
           statusEl.className = 'qr-status ok'
           toast(`账号 ${r.userid} 登录成功`, 'ok')
           refreshStatus()
+          // 刚拿到这个账号的登录凭据：此刻是请求用户预留通知邮箱的最佳时机
+          if (r.bindTicket) askEmailBind({ userid: r.userid, ticket: r.bindTicket })
         } else {
           item.done = true
           statusEl.textContent = r.status === 0 ? '✗ 二维码已过期，请重新生成' : `✗ 异常状态（${r.status}），请重新生成`
@@ -576,6 +752,8 @@ $('#btn-phone-login').addEventListener('click', async () => {
     $('#code').value = ''
     toast(`账号 ${r.userid} 登录成功`, 'ok')
     refreshStatus()
+    // 同扫码登录：登录成功即邀请预留通知邮箱（票根 10 分钟内有效）
+    if (r.bindTicket) askEmailBind({ userid: r.userid, ticket: r.bindTicket })
   } catch (e) {
     $('#phone-hint').textContent = `// ${e.message}`
     toast(e.message, 'err')
