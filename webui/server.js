@@ -989,6 +989,25 @@ app.get('/api/status', wrap(async (req, res) => {
   })
 }))
 
+/**
+ * 公开的「账号过期」清单（不校验账号管理独立密码）。
+ * 只返回 昵称 + 脱敏 userid + 检测日期，绝不返回完整 userid / token：
+ * 目的是让用户在主窗口一眼看到「哪些账号过期了」，而账号明细仍走 /api/accounts。
+ * 注意：仍受全局访问密码（WEBUI_PASSWORD）保护，那是整个 WebUI 的入口密码。
+ */
+app.get('/api/expired', wrap(async (req, res) => {
+  const invalidCreds = readCheckinStatusFile().invalidCreds
+  const accounts = readUserinfo()
+    .filter(u => invalidCreds[String(u.userid)])
+    .map(u => ({
+      // 昵称取凭据文件里已缓存的（不为此额外请求酷狗接口，避免未授权请求与风控）
+      nickname: u.nickname ? String(u.nickname) : null,
+      useridMasked: maskIdentifier(u.userid),
+      detectedAt: invalidCreds[String(u.userid)],
+    }))
+  res.json({ count: accounts.length, accounts })
+}))
+
 // ── 扫码登录 ──
 app.post('/api/qr/gen', wrap(async (req, res) => {
   // 每次生成都会向酷狗申请新的登录 key，按 IP 限流（内网/本机豁免）
@@ -1310,6 +1329,8 @@ app.get('/api/accounts', wrap(async (req, res) => {
       index: i,
       // userid 完整返回：面板整体受独立密码保护，脱敏会妨碍用户核对与搜索自己的账号
       userid: String(u.userid),
+      // 脱敏 userid：给「账号过期」这类对外展示用的小窗口，避免把完整 ID 摆在大字号列表里
+      useridMasked: maskIdentifier(u.userid),
       // 兼容字段：前端删除等操作按完整 id 进行
       rawUserid: String(u.userid),
       nickname: nicknames[vi],

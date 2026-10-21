@@ -19,8 +19,20 @@
       <span id="chip-cred" class="chip">▮ 凭据: 检测中</span>
       <span id="chip-cron" class="chip">▮ 计划: --</span>
       <span id="chip-run" class="chip">▮ 签到: --</span>
+      <!-- 有过期账号时才出现；数据来自公开脱敏接口，不需要账号管理密码 -->
+      <button id="btn-expired" class="chip chip-btn" hidden aria-expanded="false" title="点击查看登录已失效的账号清单（完整昵称 + 脱敏酷狗ID）">[ ⚠ 0 个账号已过期 · 点击查看 ▾ ]</button>
     </div>
   </header>
+
+  <!-- 过期清单：占据文档流（不浮动、无遮罩），展开时把下方内容整体下推 -->
+  <div id="expired-pop" class="expired-pop" hidden>
+    <div class="panel-head">
+      <span class="comment">// 登录已失效的账号</span>
+      <span id="expired-count" class="dim"></span>
+    </div>
+    <div id="expired-list" class="expired-list"></div>
+    <p class="tip">这些账号的 token 已被酷狗判定失效（error_code 20018），重新签到不会恢复；请用「扫码登录」或「手机号登录」重新登录，登录成功后标记会自动消失。</p>
+  </div>
 
   <!-- 标签页（编辑器风格） -->
   <nav class="tabs">
@@ -117,7 +129,9 @@
 
     <!-- 账号管理 -->
     <section id="panel-accounts" class="panel">
-      <div class="panel-head"><span class="comment">// 账号管理</span><span class="dim"> — 数据文件 data/userinfo.json</span></div>
+      <div class="panel-head">
+        <span class="comment">// 账号管理</span><span class="dim"> — 数据文件 data/userinfo.json</span>
+      </div>
 
       <!-- 独立密码锁 -->
       <div id="accounts-lock" hidden>

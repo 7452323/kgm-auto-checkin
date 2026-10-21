@@ -206,6 +206,12 @@ function showAccountsLock(msg, isErr) {
   const el = $('#accounts-lock-msg')
   el.textContent = msg || ''
   el.className = isErr ? 'err' : 'dim'
+  // 回到锁屏即视为失去面板授权：清空账号明细缓存（昵称与完整 ID 属于面板数据）。
+  // 过期清单不在此列——它来自公开脱敏接口 /api/expired，主窗口本来就能看，
+  // 所以入口按钮与已打开的窗口都保留。
+  accountsCache = []
+  accountsAdmin = false
+  updateExpiredBadge()
 }
 
 /** 账号列表的原始数据与当前搜索词（重新渲染时复用，避免搜索后刷新丢失） */
@@ -241,6 +247,7 @@ function renderAccounts(accounts, admin, mustChangePassword) {
       : ''
   }
   renderAccountList()
+  updateExpiredBadge()
 }
 
 /** 仅重绘列表部分（搜索时调用，不重复处理外层状态） */
@@ -860,6 +867,8 @@ function connectSse() {
     $('#run-state').textContent = r.ok ? '// ✓ 签到完成' : `// ✗ 签到结束，退出码 ${r.exitCode}`
     toast(r.ok ? '签到任务执行成功' : `签到任务失败（退出码 ${r.exitCode}）`, r.ok ? 'ok' : 'err')
     refreshStatus()
+    // 本轮可能新判定出凭据失效的账号，刷新过期清单
+    refreshExpired()
     // 签到结束会写盘 VIP 到期时间：若当前停在账号管理页，直接重拉列表，
     // 否则用户会看到刚签完的账号仍显示「未获取」，必须切标签页才刷新。
     if ($('#panel-accounts').classList.contains('active')) loadAccounts()
@@ -978,15 +987,125 @@ $('#accounts-search').addEventListener('input', ev => {
   $('#accounts-search')._t = setTimeout(renderAccountList, 120)
 })
 
+/* ────────────── 账号过期清单（独立小窗口） ────────────── */
+
+/**
+ * 过期账号数据源：GET /api/expired（公开脱敏清单，不需要账号管理密码）。
+ * 与账号管理面板的 accountsCache 解耦，因此未解锁时也能看到「哪些账号过期」。
+ * 后端只给 昵称 + 脱敏 userid + 检测日期，前端拿不到完整 ID。
+ */
+let expiredCache = []
+
+/** 刷新过期账号缓存与「⚠ N 个账号已过期」按钮 */
+async function refreshExpired() {
+  try {
+    const r = await api('/api/expired')
+    expiredCache = Array.isArray(r.accounts) ? r.accounts : []
+  } catch {
+    // 拉取失败时保留上一次结果，不要因为一次网络抖动就把入口清空
+    return
+  }
+  updateExpiredBadge()
+}
+
+/** 刷新按钮：没有过期账号就隐藏，同时收起已展开的面板 */
+function updateExpiredBadge() {
+  const count = expiredCache.length
+  // 失效账号全部重新登录后，面板没有内容可看，直接收起
+  if (count === 0 && isExpiredOpen()) setExpiredOpen(false)
+  syncExpiredButton()
+}
+
+/**
+ * 同步顶栏入口的文案与状态。
+ * 文案里带「点击查看」和方向箭头，配合 .warn 的脉冲动画，
+ * 让用户一眼看出这个徽章是可以点的。
+ */
+function syncExpiredButton() {
+  const btn = $('#btn-expired')
+  if (!btn) return
+  const count = expiredCache.length
+  const open = isExpiredOpen()
+  btn.hidden = count === 0
+  btn.textContent = `[ ⚠ ${count} 个账号已过期 · 点击查看 ${open ? '▴' : '▾'} ]`
+  btn.title = '点击查看登录已失效的账号清单（完整昵称 + 脱敏酷狗ID）'
+  btn.classList.toggle('warn', count > 0)
+  btn.classList.toggle('open', open)
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false')
+}
+
+/** 渲染过期账号列表：完整昵称 + 脱敏 userid + 检测日期 */
+function renderExpiredList() {
+  const box = $('#expired-list')
+  const list = expiredCache
+  const cnt = $('#expired-count')
+  if (cnt) cnt.textContent = list.length ? `— 共 ${list.length} 个` : ''
+  if (!list.length) {
+    box.innerHTML = '<div class="expired-empty dim">// 没有登录已失效的账号</div>'
+    return
+  }
+  box.innerHTML = ''
+  list.forEach((acct, i) => {
+    const row = document.createElement('div')
+    row.className = 'expired-item'
+    // 昵称完整显示；从未取到昵称时明确标注
+    const name = acct.nickname ? escapeHtml(acct.nickname) : '<span class="dim">（未获取昵称）</span>'
+    // userid 用后端给的脱敏值（与日志同一套规则），避免大字号展示完整 ID
+    const uid = escapeHtml(String(acct.useridMasked || ''))
+    const at = acct.detectedAt
+      ? `<span class="expired-at">${escapeHtml(String(acct.detectedAt))} 检测</span>`
+      : ''
+    row.innerHTML = `<span class="expired-idx">[${i + 1}]</span><span class="expired-name">${name}</span><span class="expired-uid">${uid}</span>${at}`
+    box.appendChild(row)
+  })
+}
+
+/** 面板当前是否展开 */
+function isExpiredOpen() {
+  const pop = $('#expired-pop')
+  return Boolean(pop) && !pop.hidden
+}
+
+/** 展开 / 收起面板（文档流内的一块区域，展开时把下方内容整体下推） */
+function setExpiredOpen(open) {
+  const pop = $('#expired-pop')
+  if (!pop) return
+  pop.hidden = !open
+  // 箭头方向与脉冲状态跟着变：展开后按钮高亮、停止脉冲
+  syncExpiredButton()
+  if (open) renderExpiredList()
+}
+
+function toggleExpiredPop() {
+  const next = !isExpiredOpen()
+  setExpiredOpen(next)
+  // 展开时再拉一次最新状态（可能刚重新登录成功）
+  if (next) refreshExpired().then(() => { if (isExpiredOpen()) renderExpiredList() })
+}
+
+$('#btn-expired').addEventListener('click', ev => {
+  // 阻止冒泡，避免同一次点击被别处的监听器当成「点外部」
+  ev.stopPropagation()
+  toggleExpiredPop()
+})
+
+// Esc 收起
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape' && isExpiredOpen()) setExpiredOpen(false)
+})
+
 /* ────────────────── 启动 ────────────────── */
 
 function refreshAll() {
   refreshStatus()
+  refreshExpired()
   connectSse()
 }
 
 refreshAll()
 setInterval(refreshStatus, 5000)
+// 过期清单变化很慢（只在签到判定凭据失效时更新），60 秒拉一次足够
+setInterval(refreshExpired, 60000)
 
 // 支持 #qr / #phone / #run / #accounts 直达对应标签页
 const initialTab = location.hash.replace('#', '')
