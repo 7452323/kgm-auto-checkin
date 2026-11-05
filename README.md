@@ -71,6 +71,22 @@ docker compose logs -f        # 查看日志，Ctrl+C 退出（容器继续运�
 
 容器启动后同时具备 **WebUI 控制台 + 定时自动签到**，无需任何其他配置。
 
+> [!NOTE]
+> **关于 `./data` 目录属主（"登录成功但凭据没保存"的根因）**
+>
+> 凭据目录 `./data` 是宿主机上的 bind mount。如果它由 `sudo` 或 Docker 守护进程以 `root` 创建
+> （**fork 后首次 `up` 必然如此**：`data/` 已被 `.gitignore` 忽略，克隆下来并不存在），容器内的普通用户就写不进去。
+> 表现是：**扫码 / 手机号登录都显示成功，但账号没保存，重启后消失**；`data/` 下其它文件（公告、签到状态）同样写失败。
+>
+> 本版本已自动处理：容器以 root 启动，入口脚本先把 `./data` 属主修正为 `PUID:PGID`，再**降权**到该身份运行业务进程
+> （WebUI 与签到**不会**以 root 运行）。`PUID` / `PGID` 留空时自动沿用 `./data` 现有属主；目录不存在或属主是 `root`
+> 时回落到 `1000:1000`。
+>
+> - NAS / 非 1000 uid 的用户：在 `.env` 里显式写 `PUID` / `PGID`（Linux 用 `id -u` / `id -g` 取值），否则属主会被改成 1000
+> - 从旧版本升级（`./data` 里已有 root 所有的文件）：`docker compose up -d --build` 重建即可，入口脚本会一并修正
+> - 仍有问题看启动横幅的「凭据目录」一行，它会把需要执行的 `chown` 命令原样打出来；也可手动 `sudo chown -R <uid>:<gid> ./data`
+> - **不要**用 `chmod 777` 绕过：`data/` 里是完整登录 token，等价于账号密码
+
 容器内置健康检查（每 30 秒探测 WebUI 的 `/healthz`，该端点不受 `WEBUI_PASSWORD` 保护），可用 `docker ps` 查看状态：
 
 ```bash
@@ -90,12 +106,14 @@ docker inspect --format '{{.State.Health.Status}}' kgcheckin
 | **手机号登录** | 输入手机号发送验证码（60s 冷却）→ 输入验证码一键登录 |
 | **一键签到** | 点击立即执行签到，实时彩色终端输出（与 Actions 运行日志一致），签到结束显示退出码；**当日已完成签到的账号自动跳过**（不再重复请求酷狗 API；通知单独标记"跳过"，全部跳过时不重复发送通知）；**多账号全部并行签到**（`CHECKIN_CONCURRENCY` 可限流，1 为串行） |
 | **账号管理** | 每账号独立密码（scrypt 哈希存储）：**未修改过密码的账号默认密码即其酷狗ID**，用户可凭此登录后自助修改密码（登录时会提示尽快改密）；仅可查看/管理自己的账号。管理员账号 `admin`（密码为 `ACCOUNTS_PASSWORD`，或用 `ACCOUNTS_BOOTSTRAP_PASSWORD` 首次初始化）可查看/管理所有账号，也可为任意账号设置密码；防爆破为**单账号 + 单 IP 双维度**锁定（默认账号 3 次 / IP 15 次错误，锁定 5 分钟），单账号被锁不影响其他账号 |
+| **站点公告** | 顶栏「📢 公告」入口 + 未读角标：管理员在「公告管理」标签页发布通知（标题 / 正文 / 级别 info·warn·err / 置顶 / 草稿），所有访客打开页面即可看到。**发布仅限 `admin`**（与账号管理、全量签到共用同一套密码校验与防爆破计数）；正文一律按**纯文本**渲染（不走 HTML），避免公告成为 XSS 入口。已读状态记录在**访客浏览器本地**（`localStorage`，键 `kc_ann_read`），服务端不保存「谁读过」，匿名访客同样可用——代价是换设备或清缓存后会重新显示为未读 |
 
 > - 公网暴露时，请在 `.env` 中设置 `WEBUI_PASSWORD`（全局访问密码）与 `ACCOUNTS_PASSWORD`（账号管理 admin 管理员密码），参考 `.env.example`
 > - ⚠ **关于默认密码**：酷狗ID 并非秘密（账号列表接口会返回，用户之间也会互相告知），因此知道某个 ID 的人可以登录该账号并改掉密码。该默认值为「方便用户首次改密」而保留；公网部署请设置 `WEBUI_PASSWORD`，或设 `ACCOUNTS_DISABLE_ID_DEFAULT=true` 改用「由 admin 分发密码」的方式
-> - 部署在反向代理之后时**必须**设置 `WEBUI_TRUST_PROXY`，否则所有请求会被视为来自代理内网地址，按 IP 的限流（验证码发送、二维码生成、手动签到冷却）与账号防爆破计数将**全部被豁免**；未设置时系统不会信任 `X-Forwarded-For`，以防伪造 IP 绕过计数。启动横幅会在未设置时红字提醒
-> - 发送短信验证码与生成登录二维码的接口均可匿名调用，已内置按 IP / 手机号的滑动窗口限流（可用 `WEBUI_PHONE_SEND_IP_LIMIT`、`WEBUI_PHONE_SEND_PHONE_LIMIT`、`WEBUI_QR_GEN_IP_LIMIT` 调整），防止本服务被当作短信轰炸机使用
+> - 部署在反向代理之后时**必须**设置 `WEBUI_TRUST_PROXY`，否则所有外部请求会被视为同一个代理内网地址——账号防爆破的 IP 桶会互相拖累（一人被锁波及所有人）、二维码限流会被整体豁免；未设置时系统不会信任 `X-Forwarded-For`，以防伪造 IP 绕过计数。启动横幅会在未设置时红字提醒
+> - 发送短信验证码与生成登录二维码的接口均可匿名调用，已内置滑动窗口限流（可用 `WEBUI_PHONE_SEND_GLOBAL_LIMIT`、`WEBUI_PHONE_SEND_PHONE_LIMIT`、`WEBUI_QR_GEN_IP_LIMIT` 调整），防止本服务被当作短信轰炸机使用。其中短信验证码按「全局 + 手机号」计数，不依赖来源 IP——容器端口映射下 `req.ip` 恒为网桥地址、反向代理下又来自可伪造的 `X-Forwarded-For`，按 IP 计数在生产部署里并不可靠
 > - 通知渠道密钥同样建议写在 `.env`（自动注入容器，不会被提交到仓库）
+> - 公告保存在 `data/announcements.json`（容器已挂载 `./data`，重启不丢）；**公告发布依赖 `admin` 账号可用**——若未设置 `ACCOUNTS_PASSWORD` 又没有初始化过 admin 密码，任何人都无法发布公告（读取公告不受影响）
 
 ### 4. 命令行登录（可选）
 
@@ -148,17 +166,18 @@ docker compose run --rm kgcheckin node scheduler.js once   # 或命令行方式�
 | `ACCOUNTS_MAX_ATTEMPTS` / `ACCOUNTS_LOCK_MINUTES` | `3` / `5` | 可选覆盖防爆破策略（单账号最大错误次数 / 锁定时长） |
 | `ACCOUNTS_IP_MAX_ATTEMPTS` | `ACCOUNTS_MAX_ATTEMPTS × 5` | 单个 IP 的最大错误次数（放宽以免同 NAT 用户互相影响） |
 | `ACCOUNTS_DISABLE_ID_DEFAULT` | `false` | 设为 `true` 关闭「默认密码=酷狗ID」，未设密码的账号须由 admin 先设置密码（公网部署推荐） |
-| `WEBUI_TRUST_PROXY` | - | 部署在反向代理后（Nginx/Caddy/Cloudflare Tunnel 等）时**必须**设为 `1`，以信任 `X-Forwarded-For` 取真实 IP（也可填代理跳数，如 `2`）；未设置或设为 `0`/`false` 则不信任（防伪造绕过防爆破），但公网请求会全部被视为内网来源而豁免所有按 IP 的限流 |
-| `WEBUI_PHONE_SEND_IP_LIMIT` | `3/60` | 发送短信验证码的 IP 限流（"次数/分钟"，即每 IP 每小时 3 次）；设为 `0/1` 关闭 |
+| `PUID` / `PGID` | 自动 | 容器内运行业务进程的 uid / gid。留空时自动沿用宿主 `./data` 现有属主（目录不存在或属主为 root 则用 `1000:1000`）；NAS 或非 1000 用户请显式指定。入口脚本启动时据此修正 `./data` 属主并降权 |
+| `WEBUI_TRUST_PROXY` | - | 部署在反向代理后（Nginx/Caddy/Cloudflare Tunnel 等）时**必须**设为 `1`，以信任 `X-Forwarded-For` 取真实 IP（也可填代理跳数，如 `2`）；未设置或设为 `0`/`false` 则不信任（防伪造绕过防爆破），但外部请求会被视为同一个代理内网地址，账号防爆破的 IP 桶会互相拖累、二维码限流会被豁免 |
+| `WEBUI_PHONE_SEND_GLOBAL_LIMIT` | `20/60` | 发送短信验证码的全局限流（"次数/分钟"，即全服务每小时 20 次），防换号刷量；不依赖来源 IP；设为 `0/1` 关闭 |
 | `WEBUI_PHONE_SEND_PHONE_LIMIT` | `2/1440` | 发送短信验证码的手机号限流（每号 24 小时 2 次），防止本服务被当作短信轰炸机 |
-| `WEBUI_QR_GEN_IP_LIMIT` | `1/3` | 生成登录二维码的 IP 限流（每 IP 3 分钟 1 次，每次都会向酷狗申请新 key） |
+| `WEBUI_QR_GEN_IP_LIMIT` | `1/3` | 生成登录二维码的 IP 限流（每 IP 3 分钟 1 次，每次都会向酷狗申请新 key）；内网/本机豁免 |
 | `CRON_SCHEDULE` | `10 1 * * *` | 签到计划任务（cron 表达式），默认每天北京时间 01:10 |
 | `CRON_TIMEZONE` | `Asia/Shanghai` | 调度器使用的时区 |
 | `RUN_ON_STARTUP` | `false` | 设为 `true` 时容器启动后立即执行一次签到 |
 | `CHECKIN_CONCURRENCY` | 全部并行 | 多账号签到并发路数：默认有几个账号就几路全部并行；设 N 限最多 N 路；设 1 = 逐个串行（每账号内部仍保持 30s 的 VIP 领取节奏） |
 | `USERINFO` | - | 登录凭据（JSON 数组），与 Actions 的 Secret 格式一致；与凭据文件二选一 |
 | `USERINFO_FILE` | `/app/data/userinfo.json` | 凭据文件路径（位于挂载卷内，勿改）；入口脚本会自动读取并作为 `USERINFO` 注入 |
-| 通知渠道变量 | - | `WECOM_BOT_KEY`、`DINGTALK_BOT_KEY`、`FEISHU_BOT_KEY`、`TG_BOT_TOKEN` 等，与下文 Actions 通知 Secret 同名，建议写在 `.env` 中 |
+| [通知渠道变量](https://github.com/qfmc7040/KGM-AUTO-CHECKIN/edit/main/README.md#%E9%80%9A%E7%9F%A5%E6%B8%A0%E9%81%93%E5%8F%98%E9%87%8F) | - | `WECOM_BOT_KEY`、`DINGTALK_BOT_KEY`、`FEISHU_BOT_KEY`、`TG_BOT_TOKEN` 等，与下文 Actions 通知 Secret 同名，建议写在 `.env` 中 |
 | `PAT` + `GITHUB_REPOSITORY` | - | 可选。仅当还想把每周刷新的 token 同步回 GitHub 仓库 Secret 时才需要 |
 
 ### 数据与安全
@@ -168,7 +187,9 @@ docker compose run --rm kgcheckin node scheduler.js once   # 或命令行方式�
 - 每周日签到时候酷狗 token 会自动刷新并**写回 `data/userinfo.json`**，凭据长期有效，无需手动维护
 - `data/checkin_state.json` 记录当日已完成签到的账号，供手动触发"立即签到"时跳过（按北京时间日期滚动，跨天自动失效；删除该文件可强制重新执行）
 - 日期/星期计算固定按北京时间处理，与容器 `TZ` 无关；调度时区由 `CRON_TIMEZONE` 控制
-- 首次 `up` 后若报权限错误，执行 `sudo chown -R 1000:1000 ./data`（容器以 uid 1000 运行）后重启
+- `data/` 目录属主由容器入口脚本在启动时自动修正（见上方「关于 `./data` 目录属主」），一般无需手工 chown；
+  启动横幅的「凭据目录」一行会直接显示是否可写，不可写时给出具体修复命令
+- 凭据写失败不会静默：顶栏徽章显示「凭据: 目录不可写」，扫码 / 手机号登录会提示「凭据未保存」而不是假装成功
 
 ### 常用命令速查
 
@@ -184,9 +205,7 @@ docker compose run --rm kgcheckin node qrcodeLogin.js wait  # 命令行等待扫
 docker compose pull && docker compose up -d --build         # 拉取新代码后更新
 ```
 
-<details>
-
-<summary>⚠️Github Actions部署教程(点击展开)⚠️</summary>
+## <summary>⚠️Github Actions部署教程⚠️</summary>
 
 1. Fork 本仓库
 
@@ -226,6 +245,8 @@ docker compose pull && docker compose up -d --build         # 拉取新代码后
 1. （可选）配置运行结果通知
 
    在仓库 Settings → Secrets and variables → Actions 中添加对应渠道的 Secret，签到完成后将自动推送结果通知。支持以下渠道（全部可选，配置多个将同时发送）：
+
+### 通知渠道变量
 
    | 通知渠道 | Secret 变量名 | 说明 |
    |---------|-------------|------|
@@ -268,8 +289,7 @@ docker compose pull && docker compose up -d --build         # 拉取新代码后
 | `MAIL_FROM_NAME` | `酷狗签到助手` | 发件人显示名（From 头里的名称部分） |
 | `MAIL_INVALID_NOTIFY` | 开启 | 设为 `false` / `0` 关闭按账号的失效邮件 |
 | `MAIL_NOTICE_COOLDOWN_DAYS` | `7` | 同一账号的提醒冷却天数（最小 1） |
-| `WEBUI_EMAIL_SEND_IP_LIMIT` | `5/60` | 验证码发送限流：每 IP 每小时次数（内网/本机豁免） |
-| `WEBUI_EMAIL_SEND_USER_LIMIT` | `3/60` | 验证码发送限流：每账号每小时次数 |
+| `WEBUI_EMAIL_SEND_USER_LIMIT` | `3/60` | 验证码发送限流：每账号每小时次数（按账号计数，不依赖来源 IP） |
 | `WEBUI_PUBLIC_URL` | 空 | WebUI 公网地址，会附加在失效邮件正文里方便点开重新登录 |
 
 说明与限制：
@@ -303,8 +323,6 @@ API源代码来自 [MakcRe/KuGouMusicApi](https://github.com/MakcRe/KuGouMusicAp
   ### 步骤四
    
    ![步骤四](./imgs/步骤四.jpg)
-
-</details>
 
 ## 致谢
 
